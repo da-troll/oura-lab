@@ -1,0 +1,14 @@
+{
+  "name": "oura-lab",
+  "private": true,
+  "scripts": {
+    "dev": "docker compose -f docker-compose.dev.yml up -d db && concurrently --names web,api --prefix-colors blue,green \"pnpm --dir apps/web dev\" \"cd services/analytics && uv run uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload\"",
+    "dev:db": "docker compose -f docker-compose.dev.yml up -d db",
+    "dev:stop": "docker compose -f docker-compose.dev.yml down",
+    "dev:web": "pnpm --dir apps/web dev",
+    "dev:api": "cd services/analytics && uv run uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

@@ -1,10 +1,14 @@
 """Main FastAPI application."""
 
+import logging
 from contextlib import asynccontextmanager
 from datetime import date
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger(__name__)
 
 from app.analysis import correlations, patterns
 from app.oura import auth as oura_auth
@@ -39,10 +43,51 @@ from app.schemas import (
 )
 
 
+async def run_migrations():
+    """Run SQL migrations on startup."""
+    migrations_dir = Path(__file__).parent.parent / "migrations"
+    if not migrations_dir.exists():
+        logger.warning("Migrations directory not found: %s", migrations_dir)
+        return
+
+    migration_files = sorted(migrations_dir.glob("*.sql"))
+    if not migration_files:
+        return
+
+    async with get_db() as conn:
+        # Create migrations tracking table
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
+                    filename TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            await conn.commit()
+
+            # Check which migrations have been applied
+            await cur.execute("SELECT filename FROM _migrations")
+            applied = {row["filename"] for row in await cur.fetchall()}
+
+        for migration_file in migration_files:
+            if migration_file.name in applied:
+                continue
+            logger.info("Applying migration: %s", migration_file.name)
+            sql = migration_file.read_text()
+            async with conn.cursor() as cur:
+                await cur.execute(sql)
+                await cur.execute(
+                    "INSERT INTO _migrations (filename) VALUES (%s)",
+                    (migration_file.name,),
+                )
+            await conn.commit()
+            logger.info("Applied migration: %s", migration_file.name)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
-    # Startup
+    await run_migrations()
     yield
     # Shutdown
 
