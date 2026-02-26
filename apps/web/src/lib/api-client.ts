@@ -124,7 +124,7 @@ export async function getAuthUrl(token: string): Promise<AuthUrlResponse> {
 export async function exchangeCode(
   code: string,
   token: string,
-  state?: string
+  state: string
 ): Promise<ExchangeCodeResponse> {
   return analyticsApi<ExchangeCodeResponse>("/auth/oura/exchange", {
     method: "POST",

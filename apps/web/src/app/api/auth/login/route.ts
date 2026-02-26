@@ -19,9 +19,19 @@ export async function POST(request: NextRequest) {
 
   const body = await request.json();
 
+  // Forward client IP so backend rate limiter keys on the real client, not the BFF
+  const clientIp =
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    request.headers.get("x-real-ip") ||
+    request.ip ||
+    "unknown";
+
   const response = await fetch(`${ANALYTICS_URL}/auth/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Forwarded-For": clientIp,
+    },
     body: JSON.stringify(body),
   });
 

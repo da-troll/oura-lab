@@ -217,7 +217,9 @@ async def register(body: RegisterRequest, request: Request):
 @app.post("/auth/login", response_model=AuthResponse)
 async def login(body: LoginRequest, request: Request):
     """Login with email and password."""
-    ip = request.client.host if request.client else "unknown"
+    # Prefer X-Forwarded-For (set by BFF/reverse proxy) over direct client IP
+    forwarded = request.headers.get("x-forwarded-for")
+    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
     if not await login_rate_limiter.check(ip):
         raise HTTPException(
             status_code=429,

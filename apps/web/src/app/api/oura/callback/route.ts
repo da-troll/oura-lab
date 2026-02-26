@@ -36,6 +36,13 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  if (!state) {
+    console.error("No state in OAuth callback — possible CSRF attack");
+    return NextResponse.redirect(
+      new URL("/settings?error=missing_state", baseUrl)
+    );
+  }
+
   const cookieStore = await cookies();
   const sessionToken = getSessionToken(cookieStore);
 
@@ -46,7 +53,7 @@ export async function GET(request: NextRequest) {
   try {
     // Forward code to analytics service for token exchange
     // The backend validates the OAuth state (stored in DB, bound to user)
-    const response = await exchangeCode(code, sessionToken, state || undefined);
+    const response = await exchangeCode(code, sessionToken, state);
 
     if (!response.success) {
       console.error("Token exchange failed:", response.message);
