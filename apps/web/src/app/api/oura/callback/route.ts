@@ -3,22 +3,24 @@ import { type NextRequest, NextResponse } from "next/server";
 
 import { exchangeCode } from "@/lib/api-client";
 
+function getSessionToken(cookieStore: Awaited<ReturnType<typeof cookies>>): string | undefined {
+  const isProd = process.env.NODE_ENV === "production";
+  const cookieName = isProd ? "__Host-session_token" : "session_token";
+  return cookieStore.get(cookieName)?.value;
+}
+
 /**
  * GET /api/oura/callback
- *
  * Handles the OAuth callback from Oura.
- * Verifies the state, forwards the code to the analytics service,
- * and redirects to the settings page.
+ * Uses the user's session to forward the code exchange request.
  */
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const code = searchParams.get("code");
-  const state = searchParams.get("state");
   const error = searchParams.get("error");
 
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
 
-  // Handle OAuth errors from Oura
   if (error) {
     console.error("OAuth error from Oura:", error);
     return NextResponse.redirect(
@@ -26,7 +28,6 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // Verify code is present
   if (!code) {
     console.error("No code in OAuth callback");
     return NextResponse.redirect(
@@ -34,23 +35,17 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // Verify state matches the one we stored
   const cookieStore = await cookies();
-  const storedState = cookieStore.get("oura_oauth_state")?.value;
+  const sessionToken = getSessionToken(cookieStore);
 
-  if (!storedState || storedState !== state) {
-    console.error("State mismatch in OAuth callback");
-    return NextResponse.redirect(
-      new URL("/settings?error=state_mismatch", baseUrl)
-    );
+  if (!sessionToken) {
+    return NextResponse.redirect(new URL("/login", baseUrl));
   }
-
-  // Clear the state cookie
-  cookieStore.delete("oura_oauth_state");
 
   try {
     // Forward code to analytics service for token exchange
-    const response = await exchangeCode(code);
+    // The backend validates the OAuth state (stored in DB, bound to user)
+    const response = await exchangeCode(code, sessionToken);
 
     if (!response.success) {
       console.error("Token exchange failed:", response.message);
@@ -59,7 +54,6 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // Success - redirect to settings with success flag
     return NextResponse.redirect(
       new URL("/settings?success=connected", baseUrl)
     );

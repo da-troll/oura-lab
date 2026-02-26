@@ -107,7 +107,10 @@ export default function PatternsPage() {
 
   const [error, setError] = useState<string | null>(null);
 
-  const apiUrl = process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001";
+  function getCsrfToken(): string {
+    const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
 
   const runChangePoints = async () => {
     setCpLoading(true);
@@ -118,8 +121,9 @@ export default function PatternsPage() {
         penalty: cpPenalty.toString(),
       });
 
-      const response = await fetch(`${apiUrl}/analyze/patterns/change-points?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/patterns/change-points?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to detect change points");
       const data = await response.json();
@@ -140,8 +144,9 @@ export default function PatternsPage() {
         threshold: anomalyThreshold.toString(),
       });
 
-      const response = await fetch(`${apiUrl}/analyze/patterns/anomalies?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/patterns/anomalies?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to detect anomalies");
       const data = await response.json();
@@ -161,8 +166,9 @@ export default function PatternsPage() {
       clusterFeatures.forEach((f) => params.append("features", f));
       params.append("n_clusters", nClusters.toString());
 
-      const response = await fetch(`${apiUrl}/analyze/patterns/weekly-clusters?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/patterns/weekly-clusters?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to compute clusters");
       const data = await response.json();
@@ -200,6 +206,7 @@ export default function PatternsPage() {
               <SelectItem value="correlations">Correlations</SelectItem>
               <SelectItem value="patterns">Patterns</SelectItem>
               <SelectItem value="insights">Insights</SelectItem>
+              <SelectItem value="chat">Chat</SelectItem>
             </SelectContent>
           </Select>
           <ThemeToggle />

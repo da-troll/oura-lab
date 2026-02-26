@@ -1,35 +1,63 @@
-"""Oura OAuth token management."""
+"""Oura OAuth token management (multi-user)."""
 
 import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import httpx
-import psycopg
 
-from app.db import get_db
+from app.db import get_db_for_user, get_db_system
 from app.settings import settings
+
+# Optional Fernet encryption for tokens at rest
+_fernet = None
+
+
+def _get_fernet():
+    global _fernet
+    if _fernet is None and settings.token_encryption_key:
+        from cryptography.fernet import Fernet
+        _fernet = Fernet(settings.token_encryption_key.encode())
+    return _fernet
+
+
+def _encrypt(value: str) -> str:
+    f = _get_fernet()
+    if f:
+        return f.encrypt(value.encode()).decode()
+    return value
+
+
+def _decrypt(value: str) -> str:
+    f = _get_fernet()
+    if f:
+        return f.decrypt(value.encode()).decode()
+    return value
 
 
 class OAuthError(Exception):
-    """OAuth-related error."""
-
     pass
 
 
 class TokenExpiredError(OAuthError):
-    """Token has expired and refresh failed."""
-
     pass
 
 
-async def get_auth_url() -> tuple[str, str]:
-    """Generate Oura OAuth authorization URL.
-
-    Returns:
-        Tuple of (authorization_url, state)
-    """
+async def get_auth_url(user_id: str) -> tuple[str, str]:
+    """Generate Oura OAuth authorization URL with single-use state bound to user."""
     state = secrets.token_urlsafe(32)
+
+    # Store state in DB for CSRF verification
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    async with get_db_system() as conn:
+        await conn.execute(
+            """
+            INSERT INTO oauth_states (state, user_id, expires_at)
+            VALUES (%s, %s, %s)
+            """,
+            (state, user_id, expires_at),
+        )
+        await conn.commit()
 
     params = {
         "response_type": "code",
@@ -43,18 +71,28 @@ async def get_auth_url() -> tuple[str, str]:
     return url, state
 
 
-async def exchange_code(code: str) -> dict:
-    """Exchange authorization code for tokens.
+async def consume_oauth_state(state: str, user_id: str) -> bool:
+    """Atomically consume an OAuth state (single-use + TTL + user binding).
 
-    Args:
-        code: Authorization code from OAuth callback
-
-    Returns:
-        Token response dict with access_token, refresh_token, expires_in, etc.
-
-    Raises:
-        OAuthError: If token exchange fails
+    Returns True if state was valid and consumed, False otherwise.
     """
+    async with get_db_system() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM oauth_states
+                WHERE state = %s AND user_id = %s AND expires_at > NOW()
+                RETURNING user_id
+                """,
+                (state, user_id),
+            )
+            row = await cur.fetchone()
+        await conn.commit()
+    return row is not None
+
+
+async def exchange_code(code: str) -> dict:
+    """Exchange authorization code for tokens."""
     async with httpx.AsyncClient() as client:
         response = await client.post(
             settings.oura_token_url,
@@ -68,24 +106,13 @@ async def exchange_code(code: str) -> dict:
         )
 
         if response.status_code != 200:
-            error_detail = response.text
-            raise OAuthError(f"Token exchange failed: {error_detail}")
+            raise OAuthError(f"Token exchange failed: {response.text}")
 
         return response.json()
 
 
 async def refresh_access_token(refresh_token: str) -> dict:
-    """Refresh the access token using a refresh token.
-
-    Args:
-        refresh_token: The refresh token
-
-    Returns:
-        New token response dict
-
-    Raises:
-        OAuthError: If refresh fails
-    """
+    """Refresh the access token using a refresh token."""
     async with httpx.AsyncClient() as client:
         response = await client.post(
             settings.oura_token_url,
@@ -98,26 +125,21 @@ async def refresh_access_token(refresh_token: str) -> dict:
         )
 
         if response.status_code != 200:
-            error_detail = response.text
-            raise OAuthError(f"Token refresh failed: {error_detail}")
+            raise OAuthError(f"Token refresh failed: {response.text}")
 
         return response.json()
 
 
-async def store_tokens(tokens: dict) -> None:
-    """Store OAuth tokens in the database.
-
-    Args:
-        tokens: Token response dict from Oura
-    """
+async def store_tokens(tokens: dict, user_id: str) -> None:
+    """Store OAuth tokens in the database (encrypted at rest)."""
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens["expires_in"])
 
-    async with get_db() as conn:
+    async with get_db_for_user(user_id) as conn:
         await conn.execute(
             """
-            INSERT INTO oura_auth (id, access_token, refresh_token, expires_at, token_type, scope)
-            VALUES (1, %(access_token)s, %(refresh_token)s, %(expires_at)s, %(token_type)s, %(scope)s)
-            ON CONFLICT (id) DO UPDATE SET
+            INSERT INTO oura_auth (user_id, access_token, refresh_token, expires_at, token_type, scope)
+            VALUES (%(user_id)s, %(access_token)s, %(refresh_token)s, %(expires_at)s, %(token_type)s, %(scope)s)
+            ON CONFLICT (user_id) DO UPDATE SET
                 access_token = EXCLUDED.access_token,
                 refresh_token = EXCLUDED.refresh_token,
                 expires_at = EXCLUDED.expires_at,
@@ -126,45 +148,39 @@ async def store_tokens(tokens: dict) -> None:
                 updated_at = NOW()
             """,
             {
-                "access_token": tokens["access_token"],
-                "refresh_token": tokens["refresh_token"],
+                "user_id": user_id,
+                "access_token": _encrypt(tokens["access_token"]),
+                "refresh_token": _encrypt(tokens["refresh_token"]),
                 "expires_at": expires_at,
                 "token_type": tokens.get("token_type", "Bearer"),
                 "scope": tokens.get("scope"),
             },
         )
-        await conn.commit()
 
 
-async def get_auth_record() -> dict | None:
-    """Get the current auth record from database.
-
-    Returns:
-        Auth record dict or None if not connected
-    """
-    async with get_db() as conn:
+async def get_auth_record(user_id: str) -> dict | None:
+    """Get the current auth record for a user."""
+    async with get_db_for_user(user_id) as conn:
         async with conn.cursor() as cur:
-            await cur.execute("SELECT * FROM oura_auth WHERE id = 1")
+            await cur.execute(
+                "SELECT * FROM oura_auth WHERE user_id = %s", (user_id,)
+            )
             row = await cur.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            result = dict(row)
+            result["access_token"] = _decrypt(result["access_token"])
+            result["refresh_token"] = _decrypt(result["refresh_token"])
+            return result
 
 
-async def get_valid_access_token() -> str:
-    """Get a valid access token, refreshing if necessary.
-
-    Returns:
-        Valid access token
-
-    Raises:
-        OAuthError: If not connected to Oura
-        TokenExpiredError: If refresh fails
-    """
-    auth = await get_auth_record()
+async def get_valid_access_token(user_id: str) -> str:
+    """Get a valid access token for a user, refreshing if necessary."""
+    auth = await get_auth_record(user_id)
 
     if not auth:
         raise OAuthError("Not connected to Oura. Please authorize first.")
 
-    # Check if token expires within 2 minutes
     expires_at = auth["expires_at"]
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
@@ -172,14 +188,12 @@ async def get_valid_access_token() -> str:
     buffer_time = datetime.now(timezone.utc) + timedelta(minutes=2)
 
     if expires_at <= buffer_time:
-        # Token is expired or about to expire, refresh it
         try:
             new_tokens = await refresh_access_token(auth["refresh_token"])
-            await store_tokens(new_tokens)
+            await store_tokens(new_tokens, user_id)
             return new_tokens["access_token"]
         except OAuthError as e:
-            # Refresh failed, clear auth and raise
-            await clear_auth()
+            await clear_auth(user_id)
             raise TokenExpiredError(
                 "Oura connection expired. Please reconnect."
             ) from e
@@ -187,13 +201,9 @@ async def get_valid_access_token() -> str:
     return auth["access_token"]
 
 
-async def get_auth_status() -> dict:
-    """Get current authentication status.
-
-    Returns:
-        Dict with connected status and expiration info
-    """
-    auth = await get_auth_record()
+async def get_auth_status(user_id: str) -> dict:
+    """Get current authentication status for a user."""
+    auth = await get_auth_record(user_id)
 
     if not auth:
         return {"connected": False}
@@ -211,8 +221,9 @@ async def get_auth_status() -> dict:
     }
 
 
-async def clear_auth() -> None:
-    """Clear the stored authentication."""
-    async with get_db() as conn:
-        await conn.execute("DELETE FROM oura_auth WHERE id = 1")
-        await conn.commit()
+async def clear_auth(user_id: str) -> None:
+    """Clear the stored authentication for a user."""
+    async with get_db_for_user(user_id) as conn:
+        await conn.execute(
+            "DELETE FROM oura_auth WHERE user_id = %s", (user_id,)
+        )

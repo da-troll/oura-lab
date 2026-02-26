@@ -98,14 +98,14 @@ export default function InsightsPage() {
 
   const [error, setError] = useState<string | null>(null);
 
-  const apiUrl = process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001";
+  const apiBase = "/api/analytics";
 
   // Fetch heatmap data
   const fetchHeatmap = async (metric: string) => {
     setHeatmapLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${apiUrl}/insights/heatmap?metric=${metric}&days=365`);
+      const response = await fetch(`${apiBase}/insights/heatmap?metric=${metric}&days=365`);
       if (!response.ok) throw new Error("Failed to fetch heatmap data");
       const data = await response.json();
       setHeatmapData(data);
@@ -121,7 +121,7 @@ export default function InsightsPage() {
     setSleepArchLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${apiUrl}/insights/sleep-architecture?days=${days}`);
+      const response = await fetch(`${apiBase}/insights/sleep-architecture?days=${days}`);
       if (!response.ok) throw new Error("Failed to fetch sleep architecture data");
       const data = await response.json();
       setSleepArchData(data);
@@ -137,7 +137,7 @@ export default function InsightsPage() {
     setChronotypeLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${apiUrl}/insights/chronotype`);
+      const response = await fetch(`${apiBase}/insights/chronotype`);
       if (!response.ok) throw new Error("Failed to fetch chronotype data");
       const data = await response.json();
       setChronotypeData(data);
@@ -203,6 +203,7 @@ export default function InsightsPage() {
               <SelectItem value="correlations">Correlations</SelectItem>
               <SelectItem value="patterns">Patterns</SelectItem>
               <SelectItem value="insights">Insights</SelectItem>
+              <SelectItem value="chat">Chat</SelectItem>
             </SelectContent>
           </Select>
           <ThemeToggle />

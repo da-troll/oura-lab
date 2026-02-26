@@ -1,25 +1,37 @@
 """Main FastAPI application."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
 
 from app.analysis import correlations, patterns
+from app.auth import (
+    authenticate_user,
+    cleanup_expired_sessions,
+    create_session,
+    create_user,
+    delete_session,
+    validate_password,
+)
+from app.db import get_db_for_user, get_db_system
+from app.dependencies import get_current_user
 from app.oura import auth as oura_auth
 from app.pipelines import features, ingest
-from app.db import get_db
 from app.settings import settings
 from app.schemas import (
     AnomalyResponse,
+    AuthResponse,
     AuthStatusResponse,
     AuthUrlResponse,
     ChangePointResponse,
+    ChatRequest,
     ChronotypeResponse,
     ControlledCorrelationResponse,
     CorrelationMatrixResponse,
@@ -31,7 +43,10 @@ from app.schemas import (
     HeatmapPoint,
     HeatmapResponse,
     LaggedCorrelationResponse,
+    LoginRequest,
+    MeResponse,
     PersonalInfoResponse,
+    RegisterRequest,
     ScatterDataResponse,
     SleepArchitectureDay,
     SleepArchitectureResponse,
@@ -44,7 +59,11 @@ from app.schemas import (
 
 
 async def run_migrations():
-    """Run SQL migrations on startup."""
+    """Run SQL migrations on startup (dev-only, gated by ENABLE_AUTO_MIGRATE)."""
+    if not settings.enable_auto_migrate:
+        logger.info("Auto-migration disabled (set ENABLE_AUTO_MIGRATE=true to enable)")
+        return
+
     migrations_dir = Path(__file__).parent.parent / "migrations"
     if not migrations_dir.exists():
         logger.warning("Migrations directory not found: %s", migrations_dir)
@@ -54,7 +73,7 @@ async def run_migrations():
     if not migration_files:
         return
 
-    async with get_db() as conn:
+    async with get_db_system() as conn:
         # Create migrations tracking table
         async with conn.cursor() as cur:
             await cur.execute("""
@@ -84,18 +103,32 @@ async def run_migrations():
             logger.info("Applied migration: %s", migration_file.name)
 
 
+async def periodic_cleanup():
+    """Periodically clean up expired sessions and oauth states."""
+    while True:
+        await asyncio.sleep(3600)  # Every hour
+        try:
+            count = await cleanup_expired_sessions()
+            if count:
+                logger.info("Cleaned up %d expired sessions/states", count)
+        except Exception:
+            logger.exception("Error in periodic cleanup")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     await run_migrations()
+    # Start periodic cleanup task
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     yield
-    # Shutdown
+    cleanup_task.cancel()
 
 
 app = FastAPI(
     title="Oura Analytics",
     description="Personal analytics service for Oura Ring data",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -116,6 +149,77 @@ async def health_check() -> HealthResponse:
 
 
 # ============================================
+# User Auth Endpoints
+# ============================================
+
+
+@app.post("/auth/register", response_model=AuthResponse)
+async def register(body: RegisterRequest, request: Request):
+    """Register a new user."""
+    error = validate_password(body.password)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    try:
+        user = await create_user(body.email, body.password)
+    except Exception as e:
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            raise HTTPException(status_code=409, detail="Email already registered")
+        raise HTTPException(status_code=500, detail="Registration failed")
+
+    session = await create_session(
+        user["id"],
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+
+    return AuthResponse(
+        user_id=user["id"],
+        email=user["email"],
+        session_token=session["token"],
+        expires_at=session["expires_at"],
+    )
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def login(body: LoginRequest, request: Request):
+    """Login with email and password."""
+    user = await authenticate_user(body.email, body.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    session = await create_session(
+        user["id"],
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+
+    return AuthResponse(
+        user_id=user["id"],
+        email=user["email"],
+        session_token=session["token"],
+        expires_at=session["expires_at"],
+    )
+
+
+@app.post("/auth/logout")
+async def logout(request: Request):
+    """Logout (delete session)."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if token:
+            await delete_session(token)
+    return {"success": True}
+
+
+@app.get("/auth/me", response_model=MeResponse)
+async def get_me(user: dict = Depends(get_current_user)):
+    """Get current user info."""
+    return MeResponse(user_id=user["user_id"], email=user["email"])
+
+
+# ============================================
 # Dashboard Endpoints
 # ============================================
 
@@ -123,21 +227,30 @@ async def health_check() -> HealthResponse:
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(
     days: int = Query(default=7, description="Number of days for averages and trends"),
+    user: dict = Depends(get_current_user),
 ) -> DashboardResponse:
     """Get dashboard summary data."""
     if days not in (7, 10, 30):
         raise HTTPException(status_code=400, detail="days must be 7, 10, or 30")
 
+    user_id = user["user_id"]
+
     # Check auth status
-    status = await oura_auth.get_auth_status()
-    if not status["connected"]:
+    async with get_db_for_user(user_id) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT user_id FROM oura_auth WHERE user_id = %s", (user_id,)
+            )
+            auth_row = await cur.fetchone()
+
+    if not auth_row:
         return DashboardResponse(
             connected=False,
             summary=DashboardSummary(),
             trends=[],
         )
 
-    async with get_db() as conn:
+    async with get_db_for_user(user_id) as conn:
         async with conn.cursor() as cur:
             # Get averages for the selected period
             await cur.execute("""
@@ -157,11 +270,12 @@ async def get_dashboard(
                     COUNT(*) as days_with_data
                 FROM oura_daily
                 WHERE date >= CURRENT_DATE - %(days)s
+                AND user_id = %(user_id)s
                 AND (readiness_score IS NOT NULL
                      OR sleep_score IS NOT NULL
                      OR activity_score IS NOT NULL
                      OR steps IS NOT NULL)
-            """, {"days": days})
+            """, {"days": days, "user_id": user_id})
             summary_row = await cur.fetchone()
 
             # Get trend data for the selected period
@@ -181,8 +295,9 @@ async def get_dashboard(
                     workout_total_minutes
                 FROM oura_daily
                 WHERE date >= CURRENT_DATE - %(days)s
+                AND user_id = %(user_id)s
                 ORDER BY date
-            """, {"days": days})
+            """, {"days": days, "user_id": user_id})
             trend_rows = await cur.fetchall()
 
     summary = DashboardSummary(
@@ -237,32 +352,33 @@ async def get_dashboard(
 # ============================================
 
 
-@app.get("/auth/url", response_model=AuthUrlResponse)
-async def get_auth_url() -> AuthUrlResponse:
+@app.get("/auth/oura/url", response_model=AuthUrlResponse)
+async def get_auth_url(user: dict = Depends(get_current_user)) -> AuthUrlResponse:
     """Get Oura OAuth authorization URL."""
-    url, state = await oura_auth.get_auth_url()
+    url, state = await oura_auth.get_auth_url(user["user_id"])
     return AuthUrlResponse(url=url, state=state)
 
 
 @app.post("/auth/oura/exchange", response_model=ExchangeCodeResponse)
-async def exchange_code(request: ExchangeCodeRequest) -> ExchangeCodeResponse:
-    """Exchange OAuth authorization code for tokens.
-
-    This endpoint is called by the Next.js callback handler.
-    The client_secret is used here on the server side.
-    """
+async def exchange_code(
+    request: ExchangeCodeRequest,
+    user: dict = Depends(get_current_user),
+) -> ExchangeCodeResponse:
+    """Exchange OAuth authorization code for tokens."""
     try:
         tokens = await oura_auth.exchange_code(request.code)
-        await oura_auth.store_tokens(tokens)
+        await oura_auth.store_tokens(tokens, user["user_id"])
         return ExchangeCodeResponse(success=True, message="Connected to Oura")
     except oura_auth.OAuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/auth/status", response_model=AuthStatusResponse)
-async def get_auth_status() -> AuthStatusResponse:
-    """Get current authentication status."""
-    status = await oura_auth.get_auth_status()
+@app.get("/auth/oura/status", response_model=AuthStatusResponse)
+async def get_auth_status(
+    user: dict = Depends(get_current_user),
+) -> AuthStatusResponse:
+    """Get current Oura authentication status."""
+    status = await oura_auth.get_auth_status(user["user_id"])
     return AuthStatusResponse(
         connected=status["connected"],
         expires_at=status.get("expires_at"),
@@ -270,10 +386,10 @@ async def get_auth_status() -> AuthStatusResponse:
     )
 
 
-@app.post("/auth/revoke")
-async def revoke_auth():
+@app.post("/auth/oura/revoke")
+async def revoke_auth(user: dict = Depends(get_current_user)):
     """Disconnect from Oura (clear stored tokens)."""
-    await oura_auth.clear_auth()
+    await oura_auth.clear_auth(user["user_id"])
     return {"success": True, "message": "Disconnected from Oura"}
 
 
@@ -286,14 +402,11 @@ async def revoke_auth():
 async def admin_ingest(
     start: date = Query(..., description="Start date (YYYY-MM-DD)"),
     end: date = Query(..., description="End date (YYYY-MM-DD)"),
+    user: dict = Depends(get_current_user),
 ):
-    """Run the full ingestion pipeline for a date range.
-
-    This fetches data from Oura API, stores raw payloads,
-    and normalizes into the daily tables.
-    """
+    """Run the full ingestion pipeline for a date range."""
     try:
-        result = await ingest.run_full_ingest(start, end)
+        result = await ingest.run_full_ingest(start, end, user["user_id"])
         return SyncResponse(
             status="completed",
             days_processed=result["days_processed"],
@@ -309,14 +422,11 @@ async def admin_ingest(
 async def admin_features(
     start: date = Query(..., description="Start date (YYYY-MM-DD)"),
     end: date = Query(..., description="End date (YYYY-MM-DD)"),
+    user: dict = Depends(get_current_user),
 ):
-    """Compute derived features for a date range.
-
-    This computes rolling means, lags, deltas, and variability features
-    from the daily data.
-    """
+    """Compute derived features for a date range."""
     try:
-        days_processed = await features.recompute_features(start, end)
+        days_processed = await features.recompute_features(start, end, user["user_id"])
         return SyncResponse(
             status="completed",
             days_processed=days_processed,
@@ -337,10 +447,11 @@ async def analyze_spearman(
     candidates: list[str] = Query(..., description="Candidate metrics"),
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
+    user: dict = Depends(get_current_user),
 ):
     """Compute Spearman correlations between target and candidate metrics."""
     result = await correlations.get_spearman_correlations(
-        target, candidates, start, end
+        target, candidates, start, end, user["user_id"]
     )
     return SpearmanResponse(
         target=result["target"],
@@ -361,9 +472,10 @@ async def analyze_correlation_matrix(
     metrics: list[str] = Query(..., description="Metrics to include in matrix"),
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
+    user: dict = Depends(get_current_user),
 ):
     """Compute pairwise Spearman correlation matrix for selected metrics."""
-    result = await correlations.get_correlation_matrix(metrics, start, end)
+    result = await correlations.get_correlation_matrix(metrics, start, end, user["user_id"])
     return CorrelationMatrixResponse(
         metrics=result["metrics"],
         matrix=result["matrix"],
@@ -378,9 +490,10 @@ async def analyze_scatter_data(
     metric_y: str = Query(..., description="Y-axis metric"),
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
+    user: dict = Depends(get_current_user),
 ):
     """Get scatter plot data for two metrics."""
-    result = await correlations.get_scatter_data(metric_x, metric_y, start, end)
+    result = await correlations.get_scatter_data(metric_x, metric_y, start, end, user["user_id"])
     return ScatterDataResponse(
         metric_x=result["metric_x"],
         metric_y=result["metric_y"],
@@ -399,10 +512,11 @@ async def analyze_lagged(
     max_lag: int = Query(7, description="Maximum lag to test"),
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
+    user: dict = Depends(get_current_user),
 ):
     """Compute lagged correlations to find if X predicts Y."""
     result = await correlations.get_lagged_correlations(
-        metric_x, metric_y, max_lag, start, end
+        metric_x, metric_y, max_lag, start, end, user["user_id"]
     )
     return LaggedCorrelationResponse(
         metric_x=result["metric_x"],
@@ -427,10 +541,11 @@ async def analyze_controlled(
     control_vars: list[str] = Query(..., description="Variables to control for"),
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
+    user: dict = Depends(get_current_user),
 ):
     """Compute partial correlation controlling for confounders."""
     result = await correlations.get_controlled_correlation(
-        metric_x, metric_y, control_vars, start, end
+        metric_x, metric_y, control_vars, start, end, user["user_id"]
     )
     return ControlledCorrelationResponse(
         metric_x=result["metric_x"],
@@ -453,9 +568,10 @@ async def analyze_change_points(
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
     penalty: float = Query(10.0, description="PELT penalty parameter"),
+    user: dict = Depends(get_current_user),
 ):
     """Detect change points in a metric time series."""
-    result = await patterns.get_change_points(metric, start, end, penalty)
+    result = await patterns.get_change_points(metric, start, end, penalty, user["user_id"])
     return ChangePointResponse(
         metric=result["metric"],
         change_points=[
@@ -478,9 +594,10 @@ async def analyze_anomalies(
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
     threshold: float = Query(3.0, description="Z-score threshold"),
+    user: dict = Depends(get_current_user),
 ):
     """Detect anomalies in a metric time series."""
-    result = await patterns.get_anomalies(metric, start, end, threshold)
+    result = await patterns.get_anomalies(metric, start, end, threshold, user["user_id"])
     return AnomalyResponse(
         metric=result["metric"],
         anomalies=[
@@ -501,9 +618,12 @@ async def analyze_weekly_clusters(
     n_clusters: int = Query(4, description="Number of clusters"),
     start: date | None = Query(None, description="Start date (optional)"),
     end: date | None = Query(None, description="End date (optional)"),
+    user: dict = Depends(get_current_user),
 ):
     """Cluster weeks based on feature patterns."""
-    result = await patterns.get_weekly_clusters(features_list, n_clusters, start, end)
+    result = await patterns.get_weekly_clusters(
+        features_list, n_clusters, start, end, user["user_id"]
+    )
     return WeeklyClusterResponse(
         weeks=[
             {
@@ -519,7 +639,7 @@ async def analyze_weekly_clusters(
 
 
 # ============================================
-# Insights Endpoints (Phase 1)
+# Insights Endpoints
 # ============================================
 
 
@@ -527,9 +647,12 @@ async def analyze_weekly_clusters(
 async def get_heatmap(
     metric: str = Query(..., description="Metric to display"),
     days: int = Query(365, description="Number of days to show"),
+    user: dict = Depends(get_current_user),
 ):
     """Get annual heatmap data for a metric."""
-    async with get_db() as conn:
+    user_id = user["user_id"]
+
+    async with get_db_for_user(user_id) as conn:
         async with conn.cursor() as cur:
             # Map friendly metric names to actual columns
             metric_map = {
@@ -562,8 +685,9 @@ async def get_heatmap(
                     {column} as value
                 FROM oura_daily
                 WHERE date >= CURRENT_DATE - INTERVAL '{days} days'
+                AND user_id = %(user_id)s
                 ORDER BY date
-            """)
+            """, {"user_id": user_id})
             rows = await cur.fetchall()
 
             # Calculate min/max for color scaling
@@ -585,9 +709,12 @@ async def get_heatmap(
 @app.get("/insights/sleep-architecture", response_model=SleepArchitectureResponse)
 async def get_sleep_architecture(
     days: int = Query(30, description="Number of days to show"),
+    user: dict = Depends(get_current_user),
 ):
     """Get sleep stage architecture data."""
-    async with get_db() as conn:
+    user_id = user["user_id"]
+
+    async with get_db_for_user(user_id) as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
                 SELECT
@@ -597,10 +724,11 @@ async def get_sleep_architecture(
                     sleep_rem_seconds
                 FROM oura_daily
                 WHERE date >= CURRENT_DATE - INTERVAL '%s days'
+                AND user_id = %s
                 AND sleep_total_seconds IS NOT NULL
                 AND sleep_total_seconds > 0
                 ORDER BY date
-            """, (days,))
+            """, (days, user_id))
             rows = await cur.fetchall()
 
     data = []
@@ -643,12 +771,12 @@ async def get_sleep_architecture(
 
 
 @app.get("/insights/chronotype", response_model=ChronotypeResponse)
-async def get_chronotype():
+async def get_chronotype(user: dict = Depends(get_current_user)):
     """Analyze chronotype and social jetlag from sleep patterns."""
-    async with get_db() as conn:
+    user_id = user["user_id"]
+
+    async with get_db_for_user(user_id) as conn:
         async with conn.cursor() as cur:
-            # Get sleep data with bedtime start info
-            # We need to query the raw sleep data to get bedtime_start and bedtime_end
             await cur.execute("""
                 SELECT
                     date,
@@ -657,9 +785,10 @@ async def get_chronotype():
                 FROM oura_daily
                 WHERE sleep_total_seconds IS NOT NULL
                 AND sleep_total_seconds > 0
+                AND user_id = %s
                 ORDER BY date DESC
                 LIMIT 90
-            """)
+            """, (user_id,))
             daily_rows = await cur.fetchall()
 
             # Query raw sleep data for bedtime_start and bedtime_end
@@ -670,12 +799,13 @@ async def get_chronotype():
                     r.payload->>'bedtime_end' as bedtime_end,
                     d.is_weekend
                 FROM oura_raw r
-                JOIN oura_daily d ON r.day = d.date
+                JOIN oura_daily d ON r.day = d.date AND r.user_id = d.user_id
                 WHERE r.source = 'sleep'
                 AND r.payload->>'type' = 'long_sleep'
+                AND r.user_id = %s
                 ORDER BY r.day DESC
                 LIMIT 90
-            """)
+            """, (user_id,))
             raw_rows = await cur.fetchall()
 
     if not raw_rows:
@@ -689,7 +819,7 @@ async def get_chronotype():
             recommendation="Need more sleep data to determine chronotype.",
         )
 
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
     def parse_sleep_midpoint(bedtime_start: str, bedtime_end: str) -> float | None:
         """Calculate sleep midpoint as hours from midnight."""
@@ -697,10 +827,7 @@ async def get_chronotype():
             start = datetime.fromisoformat(bedtime_start.replace("Z", "+00:00"))
             end = datetime.fromisoformat(bedtime_end.replace("Z", "+00:00"))
             midpoint = start + (end - start) / 2
-
-            # Convert to hours from midnight (handling overnight sleep)
             hours = midpoint.hour + midpoint.minute / 60
-            # If midpoint is before 6am, add 24 to normalize (sleep went past midnight)
             if hours < 6:
                 hours += 24
             return hours
@@ -732,14 +859,11 @@ async def get_chronotype():
 
     avg_weekend = sum(weekend_midpoints) / len(weekend_midpoints)
     avg_weekday = sum(weekday_midpoints) / len(weekday_midpoints)
-
-    # Social jetlag is the difference
     jetlag_hours = abs(avg_weekend - avg_weekday)
     jetlag_minutes = int(jetlag_hours * 60)
 
-    # Format midpoints as HH:MM
     def hours_to_time(h: float) -> str:
-        h = h % 24  # Normalize back
+        h = h % 24
         hours = int(h)
         minutes = int((h - hours) * 60)
         return f"{hours:02d}:{minutes:02d}"
@@ -747,19 +871,16 @@ async def get_chronotype():
     weekend_midpoint_str = hours_to_time(avg_weekend)
     weekday_midpoint_str = hours_to_time(avg_weekday)
 
-    # Determine chronotype based on weekend midpoint
-    # Before 3am = Morning Lark, After 5am = Night Owl, Between = Intermediate
-    if avg_weekend < 27:  # Before 3am (27 = 3am in our 24+ system)
+    if avg_weekend < 27:
         chronotype = "morning_lark"
-        chronotype_label = "Morning Lark 🌅"
-    elif avg_weekend > 29:  # After 5am
+        chronotype_label = "Morning Lark"
+    elif avg_weekend > 29:
         chronotype = "night_owl"
-        chronotype_label = "Night Owl 🦉"
+        chronotype_label = "Night Owl"
     else:
         chronotype = "intermediate"
-        chronotype_label = "Intermediate ⚖️"
+        chronotype_label = "Intermediate"
 
-    # Format jetlag label
     jetlag_h = jetlag_minutes // 60
     jetlag_m = jetlag_minutes % 60
     if jetlag_h > 0:
@@ -767,7 +888,6 @@ async def get_chronotype():
     else:
         jetlag_label = f"{jetlag_m}m"
 
-    # Generate recommendation
     if jetlag_minutes > 90:
         recommendation = "High social jetlag detected. Try to keep sleep times more consistent between weekdays and weekends to improve energy levels."
     elif jetlag_minutes > 60:
@@ -787,11 +907,17 @@ async def get_chronotype():
 
 
 @app.get("/personal-info", response_model=PersonalInfoResponse)
-async def get_personal_info() -> PersonalInfoResponse:
+async def get_personal_info(
+    user: dict = Depends(get_current_user),
+) -> PersonalInfoResponse:
     """Get stored personal info."""
-    async with get_db() as conn:
+    user_id = user["user_id"]
+
+    async with get_db_for_user(user_id) as conn:
         async with conn.cursor() as cur:
-            await cur.execute("SELECT * FROM oura_personal_info WHERE id = 1")
+            await cur.execute(
+                "SELECT * FROM oura_personal_info WHERE user_id = %s", (user_id,)
+            )
             row = await cur.fetchone()
 
     if not row:
@@ -805,3 +931,71 @@ async def get_personal_info() -> PersonalInfoResponse:
         email=row["email"],
         fetched_at=row["fetched_at"],
     )
+
+
+# ============================================
+# Chat Endpoints (behind feature flag)
+# ============================================
+
+
+@app.get("/chat/status")
+async def chat_status():
+    """Check if chat feature is enabled."""
+    return {"enabled": settings.chat_enabled}
+
+
+@app.post("/chat")
+async def chat_endpoint(
+    body: ChatRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Stream a chat response as NDJSON."""
+    if not settings.chat_enabled:
+        raise HTTPException(status_code=403, detail="Chat feature is not enabled")
+
+    from app.chat import run_chat
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(
+        run_chat(user["user_id"], body.message, body.conversation_id),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.get("/chat/conversations")
+async def list_conversations(user: dict = Depends(get_current_user)):
+    """List user's chat conversations."""
+    if not settings.chat_enabled:
+        raise HTTPException(status_code=403, detail="Chat feature is not enabled")
+
+    from app.chat import get_conversations
+    return await get_conversations(user["user_id"])
+
+
+@app.get("/chat/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Get messages for a specific conversation."""
+    if not settings.chat_enabled:
+        raise HTTPException(status_code=403, detail="Chat feature is not enabled")
+
+    from app.chat import get_conversation_messages
+    return await get_conversation_messages(user["user_id"], conversation_id)
+
+
+@app.delete("/chat/conversations/{conversation_id}")
+async def delete_conversation_endpoint(
+    conversation_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Delete a conversation."""
+    if not settings.chat_enabled:
+        raise HTTPException(status_code=403, detail="Chat feature is not enabled")
+
+    from app.chat import delete_conversation
+    deleted = await delete_conversation(user["user_id"], conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"success": True}

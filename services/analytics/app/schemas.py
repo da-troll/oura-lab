@@ -3,7 +3,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ============================================
@@ -18,12 +18,47 @@ class HealthResponse(BaseModel):
 
 
 # ============================================
-# Authentication
+# User Auth (registration / login / session)
+# ============================================
+
+
+class RegisterRequest(BaseModel):
+    """Request to register a new user."""
+
+    email: str
+    password: str = Field(min_length=8)
+
+
+class LoginRequest(BaseModel):
+    """Request to login."""
+
+    email: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    """Response from register or login."""
+
+    user_id: str
+    email: str
+    session_token: str
+    expires_at: datetime
+
+
+class MeResponse(BaseModel):
+    """Current user info."""
+
+    user_id: str
+    email: str
+
+
+# ============================================
+# Oura OAuth
 # ============================================
 
 
 class AuthStatusResponse(BaseModel):
-    """Authentication status response."""
+    """Oura authentication status response."""
 
     connected: bool
     expires_at: datetime | None = None
@@ -411,3 +446,31 @@ class ErrorResponse(BaseModel):
     error: str
     message: str
     details: dict | None = None
+
+
+# ============================================
+# Chat
+# ============================================
+
+
+class ChatMessage(BaseModel):
+    """A single chat message."""
+
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    """Request to send a chat message."""
+
+    message: str
+    conversation_id: str | None = None
+
+
+class ConversationSummary(BaseModel):
+    """Summary of a conversation."""
+
+    id: str
+    title: str | None
+    created_at: datetime
+    updated_at: datetime

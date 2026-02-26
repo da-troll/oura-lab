@@ -9,8 +9,13 @@ from psycopg.rows import dict_row
 from app.settings import settings
 
 
-async def get_connection() -> AsyncGenerator[psycopg.AsyncConnection, None]:
-    """Get an async database connection."""
+@asynccontextmanager
+async def get_db_system():
+    """Context manager for system-level database operations.
+
+    Used for pre-auth operations: register, login, session validation,
+    cleanup, migrations. No RLS context is set.
+    """
     async with await psycopg.AsyncConnection.connect(
         settings.database_url,
         row_factory=dict_row,
@@ -19,34 +24,33 @@ async def get_connection() -> AsyncGenerator[psycopg.AsyncConnection, None]:
 
 
 @asynccontextmanager
+async def get_db_for_user(user_id: str):
+    """Context manager for user-scoped database operations.
+
+    Sets SET LOCAL app.current_user_id for RLS enforcement.
+    The connection stays in a single transaction for the entire request.
+
+    Args:
+        user_id: UUID string of the authenticated user
+    """
+    async with await psycopg.AsyncConnection.connect(
+        settings.database_url,
+        row_factory=dict_row,
+        autocommit=False,
+    ) as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SET LOCAL app.current_user_id = %s", (str(user_id),)
+            )
+            yield conn
+
+
+# Legacy alias — banned in request handlers (use get_db_for_user or get_db_system)
+@asynccontextmanager
 async def get_db():
-    """Context manager for database connection."""
+    """Legacy context manager. Do not use in request handlers."""
     async with await psycopg.AsyncConnection.connect(
         settings.database_url,
         row_factory=dict_row,
     ) as conn:
         yield conn
-
-
-async def execute_sql(sql: str, params: tuple | None = None) -> list[dict]:
-    """Execute SQL and return results as list of dicts."""
-    async with get_db() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, params)
-            if cur.description:
-                return await cur.fetchall()
-            return []
-
-
-async def execute_sql_single(sql: str, params: tuple | None = None) -> dict | None:
-    """Execute SQL and return single result as dict."""
-    results = await execute_sql(sql, params)
-    return results[0] if results else None
-
-
-async def execute_sql_write(sql: str, params: tuple | None = None) -> None:
-    """Execute SQL write operation (INSERT/UPDATE/DELETE)."""
-    async with get_db() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, params)
-        await conn.commit()

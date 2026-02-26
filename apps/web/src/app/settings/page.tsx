@@ -3,6 +3,8 @@
 import { Suspense, useEffect, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 
+import { useAuth } from "@/lib/auth-context";
+import { clientApi } from "@/lib/api-client";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -25,7 +27,7 @@ import { ArrowLeft } from "lucide-react";
 
 interface AuthStatus {
   connected: boolean;
-  expiresAt?: string;
+  expires_at?: string;
   scopes?: string[];
 }
 
@@ -38,6 +40,7 @@ interface SyncResult {
 function SettingsContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { user, logout } = useAuth();
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -45,7 +48,6 @@ function SettingsContent() {
   const [error, setError] = useState<string | null>(null);
   const [showDisconnectDialog, setShowDisconnectDialog] = useState(false);
 
-  // Date range for backfill
   const [startDate, setStartDate] = useState(() => {
     const date = new Date();
     date.setDate(date.getDate() - 30);
@@ -55,7 +57,6 @@ function SettingsContent() {
     return new Date().toISOString().split("T")[0];
   });
 
-  // Check for OAuth callback results
   useEffect(() => {
     const success = searchParams.get("success");
     const errorParam = searchParams.get("error");
@@ -67,14 +68,10 @@ function SettingsContent() {
     }
   }, [searchParams]);
 
-  // Fetch auth status
   useEffect(() => {
     async function fetchAuthStatus() {
       try {
-        const response = await fetch(
-          `${process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001"}/auth/status`
-        );
-        const data = await response.json();
+        const data = await clientApi<AuthStatus>("/auth/oura/status");
         setAuthStatus(data);
       } catch (err) {
         console.error("Failed to fetch auth status:", err);
@@ -93,13 +90,10 @@ function SettingsContent() {
 
   const handleDisconnect = async () => {
     try {
-      await fetch(
-        `${process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001"}/auth/revoke`,
-        { method: "POST" }
-      );
+      await clientApi("/auth/oura/revoke", { method: "POST" });
       setAuthStatus({ connected: false });
       setSyncResult({ status: "success", message: "Disconnected from Oura" });
-    } catch (err) {
+    } catch {
       setError("Failed to disconnect");
     }
   };
@@ -110,33 +104,19 @@ function SettingsContent() {
     setError(null);
 
     try {
-      // Run ingestion
-      const ingestResponse = await fetch(
-        `${process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001"}/admin/ingest?start=${startDate}&end=${endDate}`,
+      const ingestResult = await clientApi<{ message: string; days_processed: number }>(
+        `/admin/ingest?start=${startDate}&end=${endDate}`,
         { method: "POST" }
       );
 
-      if (!ingestResponse.ok) {
-        throw new Error("Ingestion failed");
-      }
-
-      const ingestResult = await ingestResponse.json();
-
-      // Run feature computation
-      const featuresResponse = await fetch(
-        `${process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001"}/admin/features?start=${startDate}&end=${endDate}`,
+      const featuresResult = await clientApi<{ message: string }>(
+        `/admin/features?start=${startDate}&end=${endDate}`,
         { method: "POST" }
       );
-
-      if (!featuresResponse.ok) {
-        throw new Error("Feature computation failed");
-      }
-
-      const featuresResult = await featuresResponse.json();
 
       setSyncResult({
         status: "completed",
-        daysProcessed: ingestResult.daysProcessed,
+        daysProcessed: ingestResult.days_processed,
         message: `${ingestResult.message}. ${featuresResult.message}`,
       });
     } catch (err) {
@@ -178,6 +158,21 @@ function SettingsContent() {
         </div>
       )}
 
+      {/* User Account */}
+      <Card className="mb-6">
+        <CardHeader className="flex flex-row items-start justify-between space-y-0">
+          <div>
+            <CardTitle>Account</CardTitle>
+            <CardDescription className="mt-1.5">
+              {user?.email || "Unknown"}
+            </CardDescription>
+          </div>
+          <Button variant="outline" size="sm" onClick={logout}>
+            Sign out
+          </Button>
+        </CardHeader>
+      </Card>
+
       {/* Connection Status */}
       <Card className="mb-6">
         <CardHeader className="flex flex-row items-start justify-between space-y-0">
@@ -205,9 +200,9 @@ function SettingsContent() {
         {authStatus?.connected && (
           <CardContent>
             <div className="space-y-4">
-              {authStatus.expiresAt && (
+              {authStatus.expires_at && (
                 <p className="text-sm text-muted-foreground">
-                  Token expires: {new Date(authStatus.expiresAt).toLocaleString()}
+                  Token expires: {new Date(authStatus.expires_at).toLocaleString()}
                 </p>
               )}
               {authStatus.scopes && authStatus.scopes.length > 0 && (

@@ -167,7 +167,10 @@ export default function CorrelationsPage() {
 
   const [error, setError] = useState<string | null>(null);
 
-  const apiUrl = process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001";
+  function getCsrfToken(): string {
+    const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
 
   const runSpearman = async () => {
     setSpearmanLoading(true);
@@ -177,8 +180,9 @@ export default function CorrelationsPage() {
       params.append("target", spearmanTarget);
       spearmanCandidates.forEach((c) => params.append("candidates", c));
 
-      const response = await fetch(`${apiUrl}/analyze/correlations/spearman?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/correlations/spearman?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to compute correlations");
       const data = await response.json();
@@ -198,8 +202,9 @@ export default function CorrelationsPage() {
       const params = new URLSearchParams();
       allMetrics.forEach((m) => params.append("metrics", m));
 
-      const response = await fetch(`${apiUrl}/analyze/correlations/matrix?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/correlations/matrix?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to fetch correlation matrix");
       const data = await response.json();
@@ -221,8 +226,9 @@ export default function CorrelationsPage() {
         metric_y: spearmanTarget,
       });
 
-      const response = await fetch(`${apiUrl}/analyze/correlations/scatter-data?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/correlations/scatter-data?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to fetch scatter data");
       const data = await response.json();
@@ -254,8 +260,9 @@ export default function CorrelationsPage() {
         max_lag: maxLag.toString(),
       });
 
-      const response = await fetch(`${apiUrl}/analyze/correlations/lagged?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/correlations/lagged?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to compute lagged correlations");
       const data = await response.json();
@@ -276,8 +283,9 @@ export default function CorrelationsPage() {
       params.append("metric_y", controlledY);
       controlVars.forEach((v) => params.append("control_vars", v));
 
-      const response = await fetch(`${apiUrl}/analyze/correlations/controlled?${params}`, {
+      const response = await fetch(`/api/analytics/analyze/correlations/controlled?${params}`, {
         method: "POST",
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       if (!response.ok) throw new Error("Failed to compute controlled correlation");
       const data = await response.json();
@@ -652,6 +660,7 @@ export default function CorrelationsPage() {
               <SelectItem value="correlations">Correlations</SelectItem>
               <SelectItem value="patterns">Patterns</SelectItem>
               <SelectItem value="insights">Insights</SelectItem>
+              <SelectItem value="chat">Chat</SelectItem>
             </SelectContent>
           </Select>
           <ThemeToggle />

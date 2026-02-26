@@ -1,4 +1,4 @@
-"""Correlation analysis module."""
+"""Correlation analysis module (multi-user)."""
 
 from datetime import date
 from typing import Any
@@ -7,31 +7,24 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from app.db import get_db
+from app.db import get_db_for_user
 
 
 async def load_analysis_data(
+    user_id: str,
     start_date: date | None = None,
     end_date: date | None = None,
 ) -> pd.DataFrame:
-    """Load daily and feature data for analysis.
-
-    Args:
-        start_date: Optional start date filter
-        end_date: Optional end date filter
-
-    Returns:
-        DataFrame with merged daily and feature data
-    """
-    async with get_db() as conn:
+    """Load daily and feature data for analysis, scoped to a user."""
+    async with get_db_for_user(user_id) as conn:
         async with conn.cursor() as cur:
             query = """
                 SELECT d.*, f.*
                 FROM oura_daily d
-                LEFT JOIN oura_features_daily f ON d.date = f.date
-                WHERE 1=1
+                LEFT JOIN oura_features_daily f ON d.date = f.date AND d.user_id = f.user_id
+                WHERE d.user_id = %(uid)s
             """
-            params: dict[str, Any] = {}
+            params: dict[str, Any] = {"uid": user_id}
 
             if start_date:
                 query += " AND d.date >= %(start)s"
@@ -49,7 +42,6 @@ async def load_analysis_data(
         return pd.DataFrame()
 
     df = pd.DataFrame([dict(r) for r in rows])
-    # Handle duplicate 'date' columns from the join
     if "date" in df.columns:
         df = df.loc[:, ~df.columns.duplicated()]
     return df
@@ -60,16 +52,7 @@ def compute_spearman_correlations(
     target: str,
     candidates: list[str],
 ) -> list[dict[str, Any]]:
-    """Compute Spearman correlations between target and candidate metrics.
-
-    Args:
-        df: DataFrame with metric data
-        target: Target metric name
-        candidates: List of candidate metric names
-
-    Returns:
-        List of correlation results sorted by |rho| descending
-    """
+    """Compute Spearman correlations between target and candidate metrics."""
     if target not in df.columns:
         return []
 
@@ -81,16 +64,12 @@ def compute_spearman_correlations(
             continue
 
         candidate_series = df[candidate].dropna()
-
-        # Align series
         common_idx = target_series.index.intersection(candidate_series.index)
         if len(common_idx) < 10:
             continue
 
         x = target_series.loc[common_idx]
         y = candidate_series.loc[common_idx]
-
-        # Compute Spearman correlation
         rho, p_value = stats.spearmanr(x, y)
 
         if not np.isnan(rho):
@@ -101,7 +80,6 @@ def compute_spearman_correlations(
                 "n": len(common_idx),
             })
 
-    # Sort by absolute rho descending
     results.sort(key=lambda r: abs(r["rho"]), reverse=True)
     return results
 
@@ -112,17 +90,7 @@ def compute_lagged_correlations(
     metric_y: str,
     max_lag: int = 7,
 ) -> dict[str, Any]:
-    """Compute correlations at various lags to find if X predicts Y.
-
-    Args:
-        df: DataFrame with metric data
-        metric_x: Predictor metric
-        metric_y: Target metric
-        max_lag: Maximum lag to test
-
-    Returns:
-        Dict with lag correlations and best lag
-    """
+    """Compute correlations at various lags."""
     if metric_x not in df.columns or metric_y not in df.columns:
         return {"metric_x": metric_x, "metric_y": metric_y, "lags": [], "best_lag": 0}
 
@@ -138,18 +106,15 @@ def compute_lagged_correlations(
             x_lagged = x
             y_aligned = y
         else:
-            # X at time t predicts Y at time t+lag
             x_lagged = x.iloc[:-lag] if lag > 0 else x
             y_aligned = y.iloc[lag:] if lag > 0 else y
 
-        # Align indices
         common_idx = x_lagged.index.intersection(y_aligned.index)
         if len(common_idx) < 10:
             continue
 
         x_vals = x_lagged.loc[common_idx]
         y_vals = y_aligned.loc[common_idx]
-
         rho, p_value = stats.spearmanr(x_vals, y_vals)
 
         if not np.isnan(rho):
@@ -159,7 +124,6 @@ def compute_lagged_correlations(
                 "p_value": float(p_value),
                 "n": len(common_idx),
             })
-
             if abs(rho) > abs(best_rho):
                 best_rho = rho
                 best_lag = lag
@@ -178,60 +142,32 @@ def compute_controlled_correlation(
     metric_y: str,
     control_vars: list[str],
 ) -> dict[str, Any]:
-    """Compute partial correlation controlling for confounders.
-
-    Uses regression residuals method for partial correlation.
-
-    Args:
-        df: DataFrame with metric data
-        metric_x: First metric
-        metric_y: Second metric
-        control_vars: Variables to control for
-
-    Returns:
-        Controlled correlation result
-    """
+    """Compute partial correlation controlling for confounders."""
     required_cols = [metric_x, metric_y] + control_vars
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         return {
-            "metric_x": metric_x,
-            "metric_y": metric_y,
-            "rho": 0,
-            "p_value": 1,
-            "n": 0,
-            "controlled_for": control_vars,
+            "metric_x": metric_x, "metric_y": metric_y,
+            "rho": 0, "p_value": 1, "n": 0, "controlled_for": control_vars,
         }
 
-    # Drop rows with any NaN in required columns
     clean_df = df[required_cols].dropna()
-
     if len(clean_df) < 10:
         return {
-            "metric_x": metric_x,
-            "metric_y": metric_y,
-            "rho": 0,
-            "p_value": 1,
-            "n": len(clean_df),
-            "controlled_for": control_vars,
+            "metric_x": metric_x, "metric_y": metric_y,
+            "rho": 0, "p_value": 1, "n": len(clean_df), "controlled_for": control_vars,
         }
 
-    # Partial correlation via regression residuals
     from sklearn.linear_model import LinearRegression
 
     X_controls = clean_df[control_vars].values.astype(float)
     x = clean_df[metric_x].values.astype(float)
     y = clean_df[metric_y].values.astype(float)
 
-    # Regress X on controls
     reg_x = LinearRegression().fit(X_controls, x)
     residuals_x = x - reg_x.predict(X_controls)
-
-    # Regress Y on controls
     reg_y = LinearRegression().fit(X_controls, y)
     residuals_y = y - reg_y.predict(X_controls)
-
-    # Correlate residuals
     rho, p_value = stats.spearmanr(residuals_x, residuals_y)
 
     return {
@@ -248,15 +184,7 @@ def compute_correlation_matrix(
     df: pd.DataFrame,
     metrics: list[str],
 ) -> dict[str, Any]:
-    """Compute pairwise Spearman correlation matrix for given metrics.
-
-    Args:
-        df: DataFrame with metric data
-        metrics: List of metric names to include
-
-    Returns:
-        Dict with metrics list, rho matrix, p-value matrix, and sample size matrix
-    """
+    """Compute pairwise Spearman correlation matrix."""
     available = [m for m in metrics if m in df.columns]
     n = len(available)
     matrix = [[0.0] * n for _ in range(n)]
@@ -268,8 +196,7 @@ def compute_correlation_matrix(
             if i == j:
                 matrix[i][j] = 1.0
                 p_values[i][j] = 0.0
-                n_obs = int(df[available[i]].dropna().shape[0])
-                n_matrix[i][j] = n_obs
+                n_matrix[i][j] = int(df[available[i]].dropna().shape[0])
             elif j > i:
                 x = df[available[i]]
                 y = df[available[j]]
@@ -298,16 +225,7 @@ def get_metric_pair_data(
     metric_x: str,
     metric_y: str,
 ) -> dict[str, Any]:
-    """Extract aligned daily values for two metrics.
-
-    Args:
-        df: DataFrame with metric data
-        metric_x: First metric
-        metric_y: Second metric
-
-    Returns:
-        Dict with scatter points and sample size
-    """
+    """Extract aligned daily values for two metrics."""
     if metric_x not in df.columns or metric_y not in df.columns:
         return {"points": [], "n": 0}
 
@@ -325,13 +243,15 @@ def get_metric_pair_data(
     return {"points": points, "n": len(points)}
 
 
+# Public API functions — all take user_id
+
 async def get_correlation_matrix(
     metrics: list[str],
     start_date: date | None = None,
     end_date: date | None = None,
+    user_id: str = "",
 ) -> dict[str, Any]:
-    """Get pairwise correlation matrix for metrics."""
-    df = await load_analysis_data(start_date, end_date)
+    df = await load_analysis_data(user_id, start_date, end_date)
     if df.empty:
         return {"metrics": [], "matrix": [], "p_values": [], "n_matrix": []}
     return compute_correlation_matrix(df, metrics)
@@ -342,9 +262,9 @@ async def get_scatter_data(
     metric_y: str,
     start_date: date | None = None,
     end_date: date | None = None,
+    user_id: str = "",
 ) -> dict[str, Any]:
-    """Get scatter plot data for two metrics."""
-    df = await load_analysis_data(start_date, end_date)
+    df = await load_analysis_data(user_id, start_date, end_date)
     if df.empty:
         return {"metric_x": metric_x, "metric_y": metric_y, "points": [], "n": 0}
     result = get_metric_pair_data(df, metric_x, metric_y)
@@ -356,22 +276,11 @@ async def get_spearman_correlations(
     candidates: list[str],
     start_date: date | None = None,
     end_date: date | None = None,
+    user_id: str = "",
 ) -> dict[str, Any]:
-    """Get Spearman correlations for a target metric.
-
-    Args:
-        target: Target metric name
-        candidates: List of candidate metrics
-        start_date: Optional start date
-        end_date: Optional end date
-
-    Returns:
-        Dict with target and correlation results
-    """
-    df = await load_analysis_data(start_date, end_date)
+    df = await load_analysis_data(user_id, start_date, end_date)
     if df.empty:
         return {"target": target, "correlations": []}
-
     correlations = compute_spearman_correlations(df, target, candidates)
     return {"target": target, "correlations": correlations}
 
@@ -382,23 +291,11 @@ async def get_lagged_correlations(
     max_lag: int = 7,
     start_date: date | None = None,
     end_date: date | None = None,
+    user_id: str = "",
 ) -> dict[str, Any]:
-    """Get lagged correlations between two metrics.
-
-    Args:
-        metric_x: Predictor metric
-        metric_y: Target metric
-        max_lag: Maximum lag to test
-        start_date: Optional start date
-        end_date: Optional end date
-
-    Returns:
-        Dict with lag correlation results
-    """
-    df = await load_analysis_data(start_date, end_date)
+    df = await load_analysis_data(user_id, start_date, end_date)
     if df.empty:
         return {"metric_x": metric_x, "metric_y": metric_y, "lags": [], "best_lag": 0}
-
     return compute_lagged_correlations(df, metric_x, metric_y, max_lag)
 
 
@@ -408,28 +305,12 @@ async def get_controlled_correlation(
     control_vars: list[str],
     start_date: date | None = None,
     end_date: date | None = None,
+    user_id: str = "",
 ) -> dict[str, Any]:
-    """Get controlled (partial) correlation between two metrics.
-
-    Args:
-        metric_x: First metric
-        metric_y: Second metric
-        control_vars: Variables to control for
-        start_date: Optional start date
-        end_date: Optional end date
-
-    Returns:
-        Controlled correlation result
-    """
-    df = await load_analysis_data(start_date, end_date)
+    df = await load_analysis_data(user_id, start_date, end_date)
     if df.empty:
         return {
-            "metric_x": metric_x,
-            "metric_y": metric_y,
-            "rho": 0,
-            "p_value": 1,
-            "n": 0,
-            "controlled_for": control_vars,
+            "metric_x": metric_x, "metric_y": metric_y,
+            "rho": 0, "p_value": 1, "n": 0, "controlled_for": control_vars,
         }
-
     return compute_controlled_correlation(df, metric_x, metric_y, control_vars)

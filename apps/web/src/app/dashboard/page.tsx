@@ -94,7 +94,7 @@ export default function DashboardPage() {
       setLoading(true);
       try {
         const response = await fetch(
-          `${process.env.NEXT_PUBLIC_ANALYTICS_URL || "http://localhost:8001"}/dashboard?days=${days}`
+          `/api/analytics/dashboard?days=${days}`
         );
         if (!response.ok) {
           throw new Error("Failed to fetch dashboard data");
@@ -240,6 +240,7 @@ export default function DashboardPage() {
               <SelectItem value="correlations">Correlations</SelectItem>
               <SelectItem value="patterns">Patterns</SelectItem>
               <SelectItem value="insights">Insights</SelectItem>
+              <SelectItem value="chat">Chat</SelectItem>
             </SelectContent>
           </Select>
           <ThemeToggle />

@@ -1,4 +1,4 @@
-"""Oura API client with retry logic."""
+"""Oura API client with retry logic (multi-user)."""
 
 import asyncio
 from datetime import date
@@ -34,20 +34,18 @@ class OuraClient:
     def __init__(self):
         self.base_url = settings.oura_api_base_url
         self.max_retries = 3
-        self.base_delay = 2.0  # seconds
+        self.base_delay = 2.0
 
     async def _request(
         self,
         method: str,
         endpoint: str,
+        user_id: str,
         params: dict[str, Any] | None = None,
         retry_count: int = 0,
     ) -> dict[str, Any]:
-        """Make an authenticated request to the Oura API.
-
-        Implements exponential backoff for rate limits and transient errors.
-        """
-        token = await get_valid_access_token()
+        """Make an authenticated request to the Oura API."""
+        token = await get_valid_access_token(user_id)
 
         async with httpx.AsyncClient() as client:
             try:
@@ -65,36 +63,29 @@ class OuraClient:
                         delay = min(retry_after, self.base_delay * (2**retry_count))
                         await asyncio.sleep(delay)
                         return await self._request(
-                            method, endpoint, params, retry_count + 1
+                            method, endpoint, user_id, params, retry_count + 1
                         )
                     raise OuraRateLimitError(retry_after)
 
                 if response.status_code >= 500:
-                    # Server error - retry with backoff
                     if retry_count < self.max_retries:
                         delay = self.base_delay * (2**retry_count)
                         await asyncio.sleep(delay)
                         return await self._request(
-                            method, endpoint, params, retry_count + 1
+                            method, endpoint, user_id, params, retry_count + 1
                         )
                     raise OuraAPIError(
-                        response.status_code,
-                        "Server error",
-                        response.text,
+                        response.status_code, "Server error", response.text,
                     )
 
                 if response.status_code == 401:
                     raise OuraAPIError(
-                        401,
-                        "Unauthorized - token may be invalid",
-                        response.text,
+                        401, "Unauthorized - token may be invalid", response.text,
                     )
 
                 if response.status_code >= 400:
                     raise OuraAPIError(
-                        response.status_code,
-                        f"API error: {response.text}",
-                        response.text,
+                        response.status_code, f"API error: {response.text}", response.text,
                     )
 
                 return response.json()
@@ -104,7 +95,7 @@ class OuraClient:
                     delay = self.base_delay * (2**retry_count)
                     await asyncio.sleep(delay)
                     return await self._request(
-                        method, endpoint, params, retry_count + 1
+                        method, endpoint, user_id, params, retry_count + 1
                     )
                 raise OuraAPIError(0, "Request timeout")
 
@@ -113,61 +104,51 @@ class OuraClient:
                     delay = self.base_delay * (2**retry_count)
                     await asyncio.sleep(delay)
                     return await self._request(
-                        method, endpoint, params, retry_count + 1
+                        method, endpoint, user_id, params, retry_count + 1
                     )
                 raise OuraAPIError(0, f"Request failed: {e}")
 
     async def fetch_daily_sleep(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch daily sleep data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/daily_sleep",
+            "GET", "/usercollection/daily_sleep", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_sleep_sessions(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch sleep session data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/sleep",
+            "GET", "/usercollection/sleep", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_daily_readiness(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch daily readiness data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/daily_readiness",
+            "GET", "/usercollection/daily_readiness", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_daily_activity(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch daily activity data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/daily_activity",
+            "GET", "/usercollection/daily_activity", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_heart_rate(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch heart rate data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/heartrate",
+            "GET", "/usercollection/heartrate", user_id,
             params={
                 "start_datetime": f"{start_date}T00:00:00+00:00",
                 "end_datetime": f"{end_date}T23:59:59+00:00",
@@ -176,74 +157,61 @@ class OuraClient:
         return response.get("data", [])
 
     async def fetch_tags(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch tag data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/tag",
+            "GET", "/usercollection/tag", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_workouts(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch workout data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/workout",
+            "GET", "/usercollection/workout", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_sessions(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch session data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/session",
+            "GET", "/usercollection/session", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_daily_stress(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch daily stress data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/daily_stress",
+            "GET", "/usercollection/daily_stress", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_daily_spo2(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch daily SpO2 data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/daily_spo2",
+            "GET", "/usercollection/daily_spo2", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
     async def fetch_daily_cardiovascular_age(
-        self, start_date: date, end_date: date
+        self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        """Fetch daily cardiovascular age data for a date range."""
         response = await self._request(
-            "GET",
-            "/usercollection/daily_cardiovascular_age",
+            "GET", "/usercollection/daily_cardiovascular_age", user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
         return response.get("data", [])
 
-    async def fetch_personal_info(self) -> dict[str, Any]:
-        """Fetch personal info."""
-        return await self._request("GET", "/usercollection/personal_info")
+    async def fetch_personal_info(self, user_id: str) -> dict[str, Any]:
+        return await self._request("GET", "/usercollection/personal_info", user_id)
 
 
 # Singleton instance

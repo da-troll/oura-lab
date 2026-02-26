@@ -38,7 +38,7 @@ async function handleResponse<T>(response: Response): Promise<T> {
 }
 
 /**
- * Fetch from the analytics API (server-side only).
+ * Fetch from the analytics API (server-side only — used in BFF routes).
  */
 export async function analyticsApi<T>(
   path: string,
@@ -56,7 +56,47 @@ export async function analyticsApi<T>(
 }
 
 // ============================================
-// Auth endpoints
+// Client-side API (calls BFF proxy)
+// ============================================
+
+function getCsrfToken(): string {
+  if (typeof document === "undefined") return "";
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * Client-side fetch through the BFF proxy at /api/analytics/...
+ * Auto-attaches CSRF token on mutating requests.
+ */
+export async function clientApi<T>(
+  path: string,
+  options?: RequestInit
+): Promise<T> {
+  const url = `/api/analytics${path}`;
+  const method = options?.method?.toUpperCase() || "GET";
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options?.headers as Record<string, string>),
+  };
+
+  if (MUTATING_METHODS.has(method)) {
+    headers["X-CSRF-Token"] = getCsrfToken();
+  }
+
+  const response = await fetch(url, {
+    ...options,
+    headers,
+  });
+
+  return handleResponse<T>(response);
+}
+
+// ============================================
+// Auth endpoints (server-side, used in OAuth BFF routes)
 // ============================================
 
 export interface AuthUrlResponse {
@@ -75,24 +115,33 @@ export interface ExchangeCodeResponse {
   message?: string;
 }
 
-export async function getAuthUrl(): Promise<AuthUrlResponse> {
-  return analyticsApi<AuthUrlResponse>("/auth/url");
+export async function getAuthUrl(token: string): Promise<AuthUrlResponse> {
+  return analyticsApi<AuthUrlResponse>("/auth/oura/url", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 }
 
-export async function exchangeCode(code: string): Promise<ExchangeCodeResponse> {
+export async function exchangeCode(
+  code: string,
+  token: string
+): Promise<ExchangeCodeResponse> {
   return analyticsApi<ExchangeCodeResponse>("/auth/oura/exchange", {
     method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ code }),
   });
 }
 
-export async function getAuthStatus(): Promise<AuthStatusResponse> {
-  return analyticsApi<AuthStatusResponse>("/auth/status");
+export async function getAuthStatus(token: string): Promise<AuthStatusResponse> {
+  return analyticsApi<AuthStatusResponse>("/auth/oura/status", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 }
 
-export async function revokeAuth(): Promise<{ success: boolean }> {
-  return analyticsApi<{ success: boolean }>("/auth/revoke", {
+export async function revokeAuth(token: string): Promise<{ success: boolean }> {
+  return analyticsApi<{ success: boolean }>("/auth/oura/revoke", {
     method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 
@@ -106,32 +155,4 @@ export interface HealthResponse {
 
 export async function healthCheck(): Promise<HealthResponse> {
   return analyticsApi<HealthResponse>("/health");
-}
-
-// ============================================
-// Dashboard
-// ============================================
-
-export interface DashboardSummary {
-  readiness_avg: number | null;
-  sleep_avg: number | null;
-  activity_avg: number | null;
-  steps_avg: number | null;
-  days_with_data: number;
-}
-
-export interface TrendPoint {
-  date: string;
-  value: number | null;
-  baseline: number | null;
-}
-
-export interface DashboardResponse {
-  connected: boolean;
-  summary: DashboardSummary;
-  readiness_trend: TrendPoint[];
-}
-
-export async function getDashboard(): Promise<DashboardResponse> {
-  return analyticsApi<DashboardResponse>("/dashboard");
 }
