@@ -1,10 +1,11 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 
 import { useAuth } from "@/lib/auth-context";
 import { clientApi } from "@/lib/api-client";
+import { splitNdjsonBuffer } from "@/lib/ndjson";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,7 +24,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { ArrowLeft } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
+import { ArrowLeft, CircleHelp } from "lucide-react";
 
 interface AuthStatus {
   connected: boolean;
@@ -35,6 +38,124 @@ interface SyncResult {
   status: string;
   daysProcessed?: number;
   message?: string;
+  syncMode?: string;
+  startDate?: string;
+  endDate?: string;
+}
+
+interface SyncProgressEvent {
+  type: "progress";
+  percent: number;
+  phase?: string;
+  message?: string;
+}
+
+interface SyncDoneEvent {
+  type: "done";
+  status: string;
+  days_processed: number;
+  message?: string;
+  sync_mode?: string;
+  start_date?: string;
+  end_date?: string;
+}
+
+interface SyncErrorEvent {
+  type: "error";
+  message?: string;
+}
+
+type SyncStreamEvent = SyncProgressEvent | SyncDoneEvent | SyncErrorEvent;
+type ToastKind = "success" | "error";
+
+interface ToastItem {
+  id: number;
+  message: string;
+  kind: ToastKind;
+  visible: boolean;
+}
+
+function getCsrfToken(): string {
+  if (typeof document === "undefined") return "";
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+const PHASE_LABELS: Record<string, string> = {
+  starting: "Preparing sync",
+  resolving_window: "Preparing date range",
+  fetch_raw: "Downloading Oura data",
+  normalize_daily: "Processing daily metrics",
+  ingest_tags: "Applying tags",
+  features: "Calculating insights",
+  complete: "Sync complete",
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  daily_sleep: "sleep score",
+  sleep: "sleep session",
+  daily_readiness: "readiness",
+  daily_activity: "activity",
+  daily_stress: "stress",
+  daily_spo2: "SpO2",
+  daily_cardiovascular_age: "cardiovascular age",
+  tag: "tag",
+  workout: "workout",
+  session: "session",
+};
+
+function toTitleCase(value: string): string {
+  return value
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part[0]?.toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatPhaseLabel(phase?: string): string {
+  if (!phase) return "Syncing your data";
+  const mapped = PHASE_LABELS[phase];
+  if (mapped) return mapped;
+  return toTitleCase(phase.replace(/_/g, " "));
+}
+
+function formatSyncMessage(message?: string): string {
+  if (!message) return "";
+
+  let match = message.match(/^Fetched\s+([a-z_]+)\s+\((\d+)\/(\d+)\)$/i);
+  if (match) {
+    const source = match[1];
+    const current = match[2];
+    const total = match[3];
+    const sourceLabel = SOURCE_LABELS[source] || source.replace(/_/g, " ");
+    return `Downloaded ${sourceLabel} data (${current} of ${total}).`;
+  }
+
+  match = message.match(/^Normalized day\s+(\d+)\/(\d+)$/i);
+  if (match) {
+    return `Processed daily records (${match[1]} of ${match[2]} days).`;
+  }
+
+  match = message.match(/^Processed tags\s+(\d+)\/(\d+)$/i);
+  if (match) {
+    return `Updated tags (${match[1]} of ${match[2]}).`;
+  }
+
+  match = message.match(/^Computed features\s+(\d+)\/(\d+)$/i);
+  if (match) {
+    return `Calculated trend features (${match[1]} of ${match[2]}).`;
+  }
+
+  match = message.match(/^Sync window\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$/i);
+  if (match) {
+    return `Syncing data from ${match[1]} to ${match[2]}.`;
+  }
+
+  if (message === "Resolving sync window") return "Finding the correct date range.";
+  if (message === "Computing derived features") return "Calculating trend features.";
+  if (message === "No new days for feature recompute") return "No new days needed feature updates.";
+
+  return message;
 }
 
 function SettingsContent() {
@@ -44,27 +165,48 @@ function SettingsContent() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const [syncProgress, setSyncProgress] = useState(0);
+  const [syncPhase, setSyncPhase] = useState("");
+  const [syncMessage, setSyncMessage] = useState("");
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [showDisconnectDialog, setShowDisconnectDialog] = useState(false);
+  const toastTimersRef = useRef<number[]>([]);
+  const phaseLabel = formatPhaseLabel(syncPhase);
+  const syncMessageFriendly = formatSyncMessage(syncMessage);
 
-  const [startDate, setStartDate] = useState(() => {
-    const date = new Date();
-    date.setDate(date.getDate() - 30);
-    return date.toISOString().split("T")[0];
-  });
-  const [endDate, setEndDate] = useState(() => {
-    return new Date().toISOString().split("T")[0];
-  });
+  const showToast = (message: string, kind: ToastKind = "success") => {
+    const id = Date.now() + Math.floor(Math.random() * 1000);
+    setToasts((prev) => [...prev, { id, message, kind, visible: true }]);
+
+    const hideTimer = window.setTimeout(() => {
+      setToasts((prev) => prev.map((toast) => (
+        toast.id === id ? { ...toast, visible: false } : toast
+      )));
+    }, 3800);
+
+    const removeTimer = window.setTimeout(() => {
+      setToasts((prev) => prev.filter((toast) => toast.id !== id));
+    }, 4300);
+
+    toastTimersRef.current.push(hideTimer, removeTimer);
+  };
+
+  useEffect(() => {
+    return () => {
+      toastTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      toastTimersRef.current = [];
+    };
+  }, []);
 
   useEffect(() => {
     const success = searchParams.get("success");
     const errorParam = searchParams.get("error");
 
     if (success === "connected") {
-      setSyncResult({ status: "success", message: "Connected to Oura!" });
+      showToast("Connected to Oura.", "success");
     } else if (errorParam) {
-      setError(`OAuth error: ${errorParam}`);
+      showToast(`OAuth error: ${errorParam}`, "error");
     }
   }, [searchParams]);
 
@@ -75,7 +217,7 @@ function SettingsContent() {
         setAuthStatus(data);
       } catch (err) {
         console.error("Failed to fetch auth status:", err);
-        setError("Failed to connect to analytics service");
+        showToast("Failed to connect to analytics service.", "error");
       } finally {
         setLoading(false);
       }
@@ -92,35 +234,112 @@ function SettingsContent() {
     try {
       await clientApi("/auth/oura/revoke", { method: "POST" });
       setAuthStatus({ connected: false });
-      setSyncResult({ status: "success", message: "Disconnected from Oura" });
+      showToast("Disconnected from Oura.", "success");
     } catch {
-      setError("Failed to disconnect");
+      showToast("Failed to disconnect.", "error");
     }
   };
 
   const handleSync = async () => {
     setSyncing(true);
+    setSyncProgress(0);
+    setSyncPhase("starting");
+    setSyncMessage("Starting sync...");
     setSyncResult(null);
-    setError(null);
 
     try {
-      const ingestResult = await clientApi<{ message: string; days_processed: number }>(
-        `/admin/ingest?start=${startDate}&end=${endDate}`,
-        { method: "POST" }
-      );
+      const response = await fetch("/api/analytics/admin/ingest/stream", {
+        method: "POST",
+        headers: {
+          "X-CSRF-Token": getCsrfToken(),
+        },
+      });
 
-      const featuresResult = await clientApi<{ message: string }>(
-        `/admin/features?start=${startDate}&end=${endDate}`,
-        { method: "POST" }
-      );
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Sync failed (${response.status})`);
+      }
+
+      if (!response.body) {
+        throw new Error("Sync stream unavailable");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let doneEvent: SyncDoneEvent | null = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        const split = splitNdjsonBuffer(
+          buffer,
+          decoder.decode(value, { stream: true })
+        );
+        const lines = split.lines;
+        buffer = split.buffer;
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line) as SyncStreamEvent;
+
+          if (event.type === "progress") {
+            setSyncProgress(Math.max(0, Math.min(100, event.percent || 0)));
+            setSyncPhase(event.phase || "");
+            setSyncMessage(event.message || "");
+            continue;
+          }
+
+          if (event.type === "done") {
+            doneEvent = event;
+            setSyncProgress(100);
+            setSyncPhase("complete");
+            setSyncMessage(event.message || "Sync complete");
+            continue;
+          }
+
+          if (event.type === "error") {
+            throw new Error(event.message || "Sync failed");
+          }
+        }
+      }
+
+      if (buffer.trim()) {
+        const event = JSON.parse(buffer) as SyncStreamEvent;
+        if (event.type === "progress") {
+          setSyncProgress(Math.max(0, Math.min(100, event.percent || 0)));
+          setSyncPhase(event.phase || "");
+          setSyncMessage(event.message || "");
+        } else if (event.type === "done") {
+          doneEvent = event;
+          setSyncProgress(100);
+          setSyncPhase("complete");
+          setSyncMessage(event.message || "Sync complete");
+        } else if (event.type === "error") {
+          throw new Error(event.message || "Sync failed");
+        }
+      }
+
+      if (!doneEvent) {
+        throw new Error("Sync ended without completion event");
+      }
 
       setSyncResult({
-        status: "completed",
-        daysProcessed: ingestResult.days_processed,
-        message: `${ingestResult.message}. ${featuresResult.message}`,
+        status: doneEvent.status,
+        daysProcessed: doneEvent.days_processed,
+        message: doneEvent.message,
+        syncMode: doneEvent.sync_mode,
+        startDate: doneEvent.start_date,
+        endDate: doneEvent.end_date,
       });
+      if (doneEvent.message) {
+        showToast(doneEvent.message, "success");
+      } else {
+        showToast("Sync completed.", "success");
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Sync failed");
+      showToast(err instanceof Error ? err.message : "Sync failed", "error");
     } finally {
       setSyncing(false);
     }
@@ -136,6 +355,25 @@ function SettingsContent() {
 
   return (
     <div className="container mx-auto py-8 max-w-2xl">
+      <div className="pointer-events-none fixed inset-x-0 top-4 z-50 mx-auto flex w-[min(92vw,48rem)] flex-col gap-2">
+        {toasts.map((toast) => (
+          <div
+            key={toast.id}
+            role="status"
+            aria-live="polite"
+            className={cn(
+              "pointer-events-auto rounded-lg border px-4 py-3 text-sm shadow-lg transition-all duration-300",
+              toast.kind === "success"
+                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-100"
+                : "border-red-500/40 bg-red-500/15 text-red-100",
+              toast.visible ? "translate-y-0 opacity-100" : "-translate-y-4 opacity-0",
+            )}
+          >
+            {toast.message}
+          </div>
+        ))}
+      </div>
+
       <div className="flex justify-between items-center mb-8">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="icon" onClick={() => router.back()}>
@@ -146,32 +384,61 @@ function SettingsContent() {
         <ThemeToggle />
       </div>
 
-      {error && (
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-          {error}
-        </div>
+      {/* Data Sync */}
+      {authStatus?.connected && (
+        <Card className="mb-6">
+          <CardHeader className="flex flex-row items-start justify-between space-y-0">
+            <div>
+              <CardTitle className="flex items-center gap-1.5">
+                Data Sync
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="How sync works"
+                      className="text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      <CircleHelp className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-none whitespace-nowrap">
+                    First sync backfills your full available Oura history. Future syncs fetch only days not already stored.
+                  </TooltipContent>
+                </Tooltip>
+              </CardTitle>
+              <CardDescription className="mt-1.5">
+                Sync all missing Oura data automatically
+              </CardDescription>
+            </div>
+            <Button size="sm" onClick={handleSync} disabled={syncing}>
+              {syncing ? "Syncing..." : "Sync"}
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm text-muted-foreground">
+            {syncing && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs font-medium">
+                  <span>{phaseLabel}</span>
+                  <span>{syncProgress}%</span>
+                </div>
+                <div className="h-2 w-full rounded bg-muted">
+                  <div
+                    className="h-2 rounded bg-primary transition-all duration-300"
+                    style={{ width: `${syncProgress}%` }}
+                  />
+                </div>
+                {syncMessageFriendly && <p className="text-xs">{syncMessageFriendly}</p>}
+              </div>
+            )}
+            {syncResult?.startDate && syncResult?.endDate && (
+              <p>
+                Last sync window: {syncResult.startDate} to {syncResult.endDate}
+                {syncResult.syncMode ? ` (${syncResult.syncMode})` : ""}
+              </p>
+            )}
+          </CardContent>
+        </Card>
       )}
-
-      {syncResult && (
-        <div className="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded mb-4">
-          {syncResult.message}
-        </div>
-      )}
-
-      {/* User Account */}
-      <Card className="mb-6">
-        <CardHeader className="flex flex-row items-start justify-between space-y-0">
-          <div>
-            <CardTitle>Account</CardTitle>
-            <CardDescription className="mt-1.5">
-              {user?.email || "Unknown"}
-            </CardDescription>
-          </div>
-          <Button variant="outline" size="sm" onClick={logout}>
-            Sign out
-          </Button>
-        </CardHeader>
-      </Card>
 
       {/* Connection Status */}
       <Card className="mb-6">
@@ -222,48 +489,20 @@ function SettingsContent() {
         )}
       </Card>
 
-      {/* Data Sync */}
-      {authStatus?.connected && (
-        <Card className="mb-6">
-          <CardHeader className="flex flex-row items-start justify-between space-y-0">
-            <div>
-              <CardTitle>Data Sync</CardTitle>
-              <CardDescription className="mt-1.5">
-                Fetch and process your Oura data for analysis
-              </CardDescription>
-            </div>
-            <Button size="sm" onClick={handleSync} disabled={syncing}>
-              {syncing ? "Syncing..." : "Sync"}
-            </Button>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium mb-1">
-                  Start Date
-                </label>
-                <input
-                  type="date"
-                  value={startDate}
-                  onChange={(e) => setStartDate(e.target.value)}
-                  className="w-full border rounded px-3 py-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">
-                  End Date
-                </label>
-                <input
-                  type="date"
-                  value={endDate}
-                  onChange={(e) => setEndDate(e.target.value)}
-                  className="w-full border rounded px-3 py-2"
-                />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
+      {/* User Account */}
+      <Card className="mb-6">
+        <CardHeader className="flex flex-row items-start justify-between space-y-0">
+          <div>
+            <CardTitle>Account</CardTitle>
+            <CardDescription className="mt-1.5">
+              {user?.email || "Unknown"}
+            </CardDescription>
+          </div>
+          <Button variant="outline" size="sm" onClick={logout}>
+            Sign out
+          </Button>
+        </CardHeader>
+      </Card>
 
       <Dialog open={showDisconnectDialog} onOpenChange={setShowDisconnectDialog}>
         <DialogContent showCloseButton={false}>

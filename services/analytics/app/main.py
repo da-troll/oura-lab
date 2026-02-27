@@ -1,6 +1,7 @@
 """Main FastAPI application."""
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import date
@@ -8,6 +9,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -217,9 +219,17 @@ async def register(body: RegisterRequest, request: Request):
 @app.post("/auth/login", response_model=AuthResponse)
 async def login(body: LoginRequest, request: Request):
     """Login with email and password."""
-    # Prefer X-Forwarded-For (set by BFF/reverse proxy) over direct client IP
+    # Resolve client IP for rate limiting/audit. Prefer forwarded chain (last hop),
+    # otherwise fall back to direct client address.
+    ip = request.client.host if request.client else None
     forwarded = request.headers.get("x-forwarded-for")
-    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    if forwarded:
+        hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+        if hops:
+            ip = hops[-1]
+    if not ip:
+        ip = "unknown"
+
     if not await login_rate_limiter.check(ip):
         raise HTTPException(
             status_code=429,
@@ -232,7 +242,7 @@ async def login(body: LoginRequest, request: Request):
 
     session = await create_session(
         user["id"],
-        ip=request.client.host if request.client else None,
+        ip=ip,
         user_agent=request.headers.get("user-agent"),
     )
 
@@ -272,8 +282,8 @@ async def get_dashboard(
     user: dict = Depends(get_current_user),
 ) -> DashboardResponse:
     """Get dashboard summary data."""
-    if days not in (7, 10, 30):
-        raise HTTPException(status_code=400, detail="days must be 7, 10, or 30")
+    if days not in (7, 10, 30, 60, 100):
+        raise HTTPException(status_code=400, detail="days must be 7, 10, 30, 60, or 100")
 
     user_id = user["user_id"]
 
@@ -450,22 +460,66 @@ async def revoke_auth(user: dict = Depends(get_current_user)):
 
 @app.post("/admin/ingest", response_model=SyncResponse)
 async def admin_ingest(
-    start: date = Query(..., description="Start date (YYYY-MM-DD)"),
-    end: date = Query(..., description="End date (YYYY-MM-DD)"),
+    start: date | None = Query(None, description="Start date (YYYY-MM-DD, optional)"),
+    end: date | None = Query(None, description="End date (YYYY-MM-DD, optional)"),
     user: dict = Depends(get_current_user),
 ):
-    """Run the full ingestion pipeline for a date range."""
+    """Run ingestion pipeline.
+
+    If start/end are omitted, performs automatic sync:
+    - First sync: backfill from oldest available Oura day.
+    - Later syncs: fetch only missing days since latest stored date.
+    """
+    if (start is None) != (end is None):
+        raise HTTPException(status_code=400, detail="Provide both start and end, or neither")
+
     try:
         result = await ingest.run_full_ingest(start, end, user["user_id"])
+
+        if result["days_processed"] == 0:
+            if result.get("sync_mode") == "incremental":
+                msg = "Already up to date. No new days to sync."
+            else:
+                msg = "No Oura data found to sync yet."
+        else:
+            msg = (
+                f"Ingested {result['days_processed']} days"
+                f" ({result.get('sync_mode', 'manual')})"
+            )
+
         return SyncResponse(
             status="completed",
             days_processed=result["days_processed"],
-            message=f"Ingested {result['days_processed']} days, {result['tags_processed']} tags",
+            message=msg,
+            start_date=result.get("start_date"),
+            end_date=result.get("end_date"),
+            sync_mode=result.get("sync_mode"),
         )
     except oura_auth.OAuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/ingest/stream")
+async def admin_ingest_stream(
+    start: date | None = Query(None, description="Start date (YYYY-MM-DD, optional)"),
+    end: date | None = Query(None, description="End date (YYYY-MM-DD, optional)"),
+    user: dict = Depends(get_current_user),
+):
+    """Run ingestion pipeline and stream progress as NDJSON."""
+    if (start is None) != (end is None):
+        raise HTTPException(status_code=400, detail="Provide both start and end, or neither")
+
+    async def stream():
+        async for event in ingest.run_full_ingest_stream(start, end, user["user_id"]):
+            yield json.dumps(event) + "\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.post("/admin/features", response_model=SyncResponse)

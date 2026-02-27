@@ -1,6 +1,7 @@
 """Pydantic schemas mirroring the shared Zod schemas."""
 
 from datetime import date, datetime
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field
@@ -319,6 +320,9 @@ class SyncResponse(BaseModel):
     status: Literal["completed", "failed", "in_progress"]
     days_processed: int | None = None
     message: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    sync_mode: Literal["manual", "initial_backfill", "incremental"] | None = None
 
 
 # ============================================
@@ -458,6 +462,7 @@ class ChatMessage(BaseModel):
 
     role: Literal["user", "assistant", "system"]
     content: str
+    artifacts: list[dict[str, Any]] | None = None
 
 
 class ChatRequest(BaseModel):

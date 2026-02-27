@@ -1,17 +1,18 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 
 import { clientApi } from "@/lib/api-client";
+import { ChatChart, type ChatChartArtifact } from "@/components/chat-chart";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardHeader,
-  CardTitle,
 } from "@/components/ui/card";
 import {
   Select,
@@ -25,7 +26,7 @@ import { Settings, Send, Plus, Trash2, Loader2 } from "lucide-react";
 interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
-  toolCalls?: { name: string; args: Record<string, unknown> }[];
+  artifacts?: ChatChartArtifact[];
 }
 
 interface Conversation {
@@ -34,6 +35,95 @@ interface Conversation {
   created_at: string;
   updated_at: string;
 }
+
+const FOLLOW_UP_TEXT = "Would you like a different time period, chart type, or another edit?";
+
+function parseTableRow(line: string): string[] {
+  return line
+    .split("|")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+}
+
+function toRenderableMarkdown(content: string): string {
+  // Some model outputs collapse table rows into a single line using "||".
+  const expanded = content.replace(
+    /\|\|\s*(?=(?:\d{4}-\d{2}-\d{2}|:?-{3,}))/g,
+    "|\n|",
+  );
+  const lines = expanded.split("\n");
+  const out: string[] = [];
+  const dividerRe = /^\|?\s*:?-{3,}\s*(\|\s*:?-{3,}\s*)+\|?$/;
+
+  let i = 0;
+  while (i < lines.length) {
+    const headerLine = lines[i].trim();
+    const dividerLine = i + 1 < lines.length ? lines[i + 1].trim() : "";
+    const isTableHeader = headerLine.startsWith("|") && headerLine.endsWith("|");
+
+    if (isTableHeader && dividerRe.test(dividerLine)) {
+      const headers = parseTableRow(headerLine);
+      i += 2;
+      let rowCount = 0;
+
+      while (i < lines.length) {
+        const rowLine = lines[i].trim();
+        if (!(rowLine.startsWith("|") && rowLine.endsWith("|"))) break;
+        const cells = parseTableRow(rowLine);
+        const row = headers.map((header, idx) => `${header}: ${cells[idx] ?? "—"}`);
+        out.push(`- ${row.join(" · ")}`);
+        rowCount += 1;
+        i += 1;
+      }
+
+      if (rowCount === 0 && headers.length > 0) {
+        out.push(`- ${headers.join(" · ")}`);
+      }
+      out.push("");
+      continue;
+    }
+
+    out.push(lines[i]);
+    i += 1;
+  }
+
+  return out.join("\n");
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitFollowUp(content: string): { body: string; hasFollowUp: boolean } {
+  if (!content) return { body: "", hasFollowUp: false };
+  const trimmed = content.trimEnd();
+
+  const italicPattern = new RegExp(`\\*${escapeRegex(FOLLOW_UP_TEXT)}\\*\\s*$`, "i");
+  if (italicPattern.test(trimmed)) {
+    return {
+      body: trimmed.replace(italicPattern, "").trimEnd(),
+      hasFollowUp: true,
+    };
+  }
+
+  const plainPattern = new RegExp(`${escapeRegex(FOLLOW_UP_TEXT)}\\s*$`, "i");
+  if (plainPattern.test(trimmed)) {
+    return {
+      body: trimmed.replace(plainPattern, "").trimEnd(),
+      hasFollowUp: true,
+    };
+  }
+
+  return { body: trimmed, hasFollowUp: false };
+}
+
+const markdownComponents: Components = {
+  img: ({ alt }) => (
+    <span className="text-xs text-muted-foreground">
+      {alt ? `[Image omitted: ${alt}]` : "[Image omitted]"}
+    </span>
+  ),
+};
 
 function getCsrfToken(): string {
   const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
@@ -51,37 +141,19 @@ export default function ChatPage() {
   const [toolStatus, setToolStatus] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Check if chat is enabled
-  useEffect(() => {
-    async function checkStatus() {
-      try {
-        const data = await clientApi<{ enabled: boolean }>("/chat/status");
-        setChatEnabled(data.enabled);
-        if (data.enabled) {
-          loadConversations();
-        }
-      } catch {
-        setChatEnabled(false);
-      }
-    }
-    checkStatus();
-  }, []);
-
-  async function loadConversations() {
-    try {
-      const data = await clientApi<Conversation[]>("/chat/conversations");
-      setConversations(data);
-    } catch {
-      // Ignore
-    }
-  }
+  const introTriggered = useRef(false);
 
   async function loadConversation(id: string) {
     try {
       const data = await clientApi<ChatMessage[]>(
         `/chat/conversations/${id}`
       );
-      setMessages(data);
+      setMessages(
+        data.map((msg) => ({
+          ...msg,
+          artifacts: Array.isArray(msg.artifacts) ? msg.artifacts : undefined,
+        }))
+      );
       setConversationId(id);
     } catch {
       // Ignore
@@ -105,6 +177,7 @@ export default function ChatPage() {
     setConversationId(null);
     setMessages([]);
     setInput("");
+    triggerIntro();
   }
 
   async function sendMessage() {
@@ -112,12 +185,20 @@ export default function ChatPage() {
     if (!text || loading) return;
 
     setInput("");
+    await sendRaw(text, { showUserMessage: true, convId: conversationId });
+  }
+
+  const sendRaw = useCallback(async (
+    text: string,
+    opts: { showUserMessage: boolean; convId: string | null },
+  ) => {
     setLoading(true);
     setToolStatus(null);
 
-    // Add user message immediately
-    const userMessage: ChatMessage = { role: "user", content: text };
-    setMessages((prev) => [...prev, userMessage]);
+    if (opts.showUserMessage) {
+      const userMessage: ChatMessage = { role: "user", content: text };
+      setMessages((prev) => [...prev, userMessage]);
+    }
 
     try {
       const baseUrl = "/api/analytics/chat";
@@ -129,7 +210,7 @@ export default function ChatPage() {
         },
         body: JSON.stringify({
           message: text,
-          conversation_id: conversationId,
+          conversation_id: opts.convId,
         }),
       });
 
@@ -143,6 +224,7 @@ export default function ChatPage() {
       const decoder = new TextDecoder();
       let buffer = "";
       let assistantContent = "";
+      let assistantArtifacts: ChatChartArtifact[] = [];
 
       while (true) {
         const { done, value } = await reader.read();
@@ -178,14 +260,45 @@ export default function ChatPage() {
                   if (last?.role === "assistant") {
                     return [
                       ...prev.slice(0, -1),
-                      { ...last, content: assistantContent },
+                      { ...last, content: assistantContent, artifacts: last.artifacts ?? assistantArtifacts },
                     ];
                   }
                   return [
                     ...prev,
-                    { role: "assistant", content: assistantContent },
+                    {
+                      role: "assistant",
+                      content: assistantContent,
+                      artifacts: assistantArtifacts.length ? assistantArtifacts : undefined,
+                    },
                   ];
                 });
+                break;
+
+              case "chart":
+                if (chunk.chart) {
+                  const chart = chunk.chart as ChatChartArtifact;
+                  assistantArtifacts = [...assistantArtifacts, chart];
+                  setMessages((prev) => {
+                    const last = prev[prev.length - 1];
+                    if (last?.role === "assistant") {
+                      return [
+                        ...prev.slice(0, -1),
+                        {
+                          ...last,
+                          artifacts: [...(last.artifacts ?? []), chart],
+                        },
+                      ];
+                    }
+                    return [
+                      ...prev,
+                      {
+                        role: "assistant",
+                        content: "",
+                        artifacts: [chart],
+                      },
+                    ];
+                  });
+                }
                 break;
 
               case "error":
@@ -208,7 +321,12 @@ export default function ChatPage() {
       }
 
       // Refresh conversation list
-      loadConversations();
+      try {
+        const convos = await clientApi<Conversation[]>("/chat/conversations");
+        setConversations(convos);
+      } catch {
+        // Ignore
+      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -221,7 +339,33 @@ export default function ChatPage() {
       setLoading(false);
       setToolStatus(null);
     }
-  }
+  }, []);
+
+  const triggerIntro = useCallback(async () => {
+    await sendRaw("__OURALIE_INTRO__", { showUserMessage: false, convId: null });
+  }, [sendRaw]);
+
+  // Check if chat is enabled
+  useEffect(() => {
+    async function checkStatus() {
+      try {
+        const data = await clientApi<{ enabled: boolean }>("/chat/status");
+        setChatEnabled(data.enabled);
+        if (data.enabled) {
+          const convos = await clientApi<Conversation[]>("/chat/conversations");
+          setConversations(convos);
+          // Auto-trigger intro if no existing conversations
+          if (convos.length === 0 && !introTriggered.current) {
+            introTriggered.current = true;
+            triggerIntro();
+          }
+        }
+      } catch {
+        setChatEnabled(false);
+      }
+    }
+    checkStatus();
+  }, [triggerIntro]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -321,7 +465,7 @@ export default function ChatPage() {
       <div className="flex-1 flex flex-col">
         {/* Header */}
         <div className="flex justify-between items-center p-4 border-b">
-          <h1 className="text-xl font-semibold">Health Assistant</h1>
+          <h1 className="text-xl font-semibold">Ouralie</h1>
           <div className="flex items-center gap-2">
             <Select
               value="chat"
@@ -349,10 +493,10 @@ export default function ChatPage() {
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {messages.length === 0 && (
+          {messages.length === 0 && !loading && (
             <div className="text-center text-muted-foreground py-20">
               <p className="text-lg font-medium mb-2">
-                Ask me about your health data
+                Ask Ouralie about your health data
               </p>
               <p className="text-sm">
                 Try: &quot;How was my sleep this week?&quot; or &quot;What
@@ -361,7 +505,13 @@ export default function ChatPage() {
             </div>
           )}
 
-          {messages.map((msg, i) => (
+          {messages.map((msg, i) => {
+            const { body, hasFollowUp } =
+              msg.role === "assistant"
+                ? splitFollowUp(msg.content)
+                : { body: msg.content, hasFollowUp: false };
+
+            return (
             <div
               key={i}
               className={`flex ${
@@ -375,10 +525,28 @@ export default function ChatPage() {
                     : "bg-muted"
                 }`}
               >
-                <p className="whitespace-pre-wrap text-sm">{msg.content}</p>
+                {msg.role === "assistant" ? (
+                  <div className="prose prose-sm dark:prose-invert max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+                    {msg.artifacts?.length ? <div className="h-4" aria-hidden /> : null}
+                    {msg.artifacts?.map((chart, idx) => (
+                      <ChatChart key={`${i}-chart-${idx}`} chart={chart} />
+                    ))}
+                    {body ? (
+                      <ReactMarkdown components={markdownComponents}>
+                        {toRenderableMarkdown(body)}
+                      </ReactMarkdown>
+                    ) : null}
+                    {hasFollowUp ? (
+                      <p className="mt-6 italic text-muted-foreground">{FOLLOW_UP_TEXT}</p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="whitespace-pre-wrap text-sm">{msg.content}</p>
+                )}
               </div>
             </div>
-          ))}
+            );
+          })}
 
           {toolStatus && (
             <div className="flex justify-start">

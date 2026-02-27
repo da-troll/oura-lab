@@ -1,8 +1,9 @@
 """Ingestion pipeline: Oura API -> raw -> daily tables (multi-user)."""
 
+import asyncio
 import json
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 from app.db import get_db_for_user
 from app.oura.client import oura_client
@@ -27,11 +28,79 @@ def resolve_sleep_day(sleep_session: dict[str, Any]) -> date | None:
     return None
 
 
+def select_primary_sleep_session(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pick the canonical nightly sleep session for a day.
+
+    Preference order:
+    1) long_sleep sessions (nightly sleep)
+    2) if no explicit types are present, fall back to untyped records
+    3) highest total_sleep_duration
+    4) latest bedtime_end (stable tie-breaker)
+
+    If records are present but none are nightly candidates (for example, naps),
+    return {} so nightly metrics remain empty instead of recording tiny durations.
+    """
+    if not sessions:
+        return {}
+
+    def _session_type(session: dict[str, Any]) -> str:
+        value = session.get("type")
+        return str(value).strip().lower() if value is not None else ""
+
+    def _to_seconds(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _score(session: dict[str, Any]) -> tuple[int, float, str]:
+        session_type = _session_type(session)
+        is_long_sleep = 1 if session_type == "long_sleep" else 0
+        total_sleep_seconds = _to_seconds(session.get("total_sleep_duration"))
+        bedtime_end = str(session.get("bedtime_end") or "")
+        return (is_long_sleep, total_sleep_seconds, bedtime_end)
+
+    normalized = [session for session in sessions if isinstance(session, dict)]
+    if not normalized:
+        return {}
+
+    long_sleep_sessions = [
+        session for session in normalized if _session_type(session) == "long_sleep"
+    ]
+    if long_sleep_sessions:
+        return max(long_sleep_sessions, key=_score)
+
+    # Backward-compatibility for payloads that do not include "type".
+    untyped_sessions = [session for session in normalized if _session_type(session) == ""]
+    if untyped_sessions:
+        return max(untyped_sessions, key=_score)
+
+    # Typed but non-nightly sessions only (for example naps): do not
+    # produce nightly sleep metrics from these.
+    return {}
+
+
+def resolve_raw_record_day(data_type: str, record: dict[str, Any]) -> Any:
+    """Resolve the storage day key for a raw record."""
+    day = record.get("day")
+    if data_type == "sleep" and not day:
+        # Keep Oura's canonical day when present; only derive from bedtime_end
+        # as a fallback for malformed/missing day values.
+        resolved_day = resolve_sleep_day(record)
+        return str(resolved_day) if resolved_day else day
+    return day
+
+
 async def ingest_raw_data(
     start_date: date,
     end_date: date,
     user_id: str,
     data_types: list[str] | None = None,
+    progress_callback: Callable[[str, int, int], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
     """Fetch raw data from Oura API and store in oura_raw table."""
     if data_types is None:
@@ -57,8 +126,13 @@ async def ingest_raw_data(
     }
 
     async with get_db_for_user(user_id) as conn:
+        total_types = len(data_types)
+        completed_types = 0
         for data_type in data_types:
             if data_type not in fetch_map:
+                completed_types += 1
+                if progress_callback is not None:
+                    await progress_callback(data_type, completed_types, total_types)
                 continue
 
             fetch_fn = fetch_map[data_type]
@@ -66,14 +140,14 @@ async def ingest_raw_data(
                 records = await fetch_fn(start_date, end_date, user_id)
             except Exception:
                 counts[data_type] = 0
+                completed_types += 1
+                if progress_callback is not None:
+                    await progress_callback(data_type, completed_types, total_types)
                 continue
             counts[data_type] = len(records)
 
             for record in records:
-                day = record.get("day")
-                if data_type == "sleep":
-                    resolved_day = resolve_sleep_day(record)
-                    day = str(resolved_day) if resolved_day else day
+                day = resolve_raw_record_day(data_type, record)
 
                 await conn.execute(
                     """
@@ -89,13 +163,23 @@ async def ingest_raw_data(
                     },
                 )
 
+            completed_types += 1
+            if progress_callback is not None:
+                await progress_callback(data_type, completed_types, total_types)
+
     return counts
 
 
-async def normalize_daily_data(start_date: date, end_date: date, user_id: str) -> int:
+async def normalize_daily_data(
+    start_date: date,
+    end_date: date,
+    user_id: str,
+    progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+) -> int:
     """Normalize raw data into oura_daily table."""
     days_processed = 0
     current = start_date
+    total_days = (end_date - start_date).days + 1
 
     async with get_db_for_user(user_id) as conn:
         while current <= end_date:
@@ -110,11 +194,16 @@ async def normalize_daily_data(start_date: date, end_date: date, user_id: str) -
 
                 # Get sleep session data
                 await cur.execute(
-                    "SELECT payload FROM oura_raw WHERE source = 'sleep' AND day = %(day)s AND user_id = %(uid)s ORDER BY fetched_at DESC LIMIT 1",
+                    "SELECT payload FROM oura_raw WHERE source = 'sleep' AND day = %(day)s AND user_id = %(uid)s",
                     {"day": str(current), "uid": user_id},
                 )
-                sleep_session_row = await cur.fetchone()
-                sleep_session_data = sleep_session_row["payload"] if sleep_session_row else {}
+                sleep_session_rows = await cur.fetchall()
+                sleep_sessions = [
+                    row["payload"]
+                    for row in sleep_session_rows
+                    if isinstance(row.get("payload"), dict)
+                ]
+                sleep_session_data = select_primary_sleep_session(sleep_sessions)
 
                 # Get daily_readiness data
                 await cur.execute(
@@ -444,11 +533,19 @@ async def normalize_daily_data(start_date: date, end_date: date, user_id: str) -
                 days_processed += 1
 
             current += timedelta(days=1)
+            if progress_callback is not None:
+                processed_days = (current - start_date).days
+                await progress_callback(processed_days, total_days)
 
     return days_processed
 
 
-async def ingest_tags(start_date: date, end_date: date, user_id: str) -> int:
+async def ingest_tags(
+    start_date: date,
+    end_date: date,
+    user_id: str,
+    progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+) -> int:
     """Normalize tags from raw data into oura_day_tags table."""
     tags_processed = 0
 
@@ -459,8 +556,9 @@ async def ingest_tags(start_date: date, end_date: date, user_id: str) -> int:
                 {"start": str(start_date), "end": str(end_date), "uid": user_id},
             )
             tag_rows = await cur.fetchall()
+            total_rows = len(tag_rows)
 
-        for row in tag_rows:
+        for idx, row in enumerate(tag_rows, start=1):
             day = row["day"]
             payload = row["payload"]
 
@@ -503,6 +601,9 @@ async def ingest_tags(start_date: date, end_date: date, user_id: str) -> int:
             )
             tags_processed += 1
 
+            if progress_callback is not None:
+                await progress_callback(idx, total_rows)
+
     return tags_processed
 
 
@@ -542,8 +643,265 @@ async def ingest_personal_info(user_id: str) -> bool:
     return True
 
 
-async def run_full_ingest(start_date: date, end_date: date, user_id: str) -> dict[str, Any]:
+async def resolve_sync_window(user_id: str) -> tuple[date, date, str]:
+    """Resolve sync range.
+
+    First sync: discover oldest available Oura day and backfill to today.
+    Subsequent syncs: fetch only missing days since latest stored date.
+    """
+    today = datetime.now(timezone.utc).date()
+
+    latest_synced: date | None = None
+    async with get_db_for_user(user_id) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT MAX(date) AS latest_date FROM oura_daily WHERE user_id = %s",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            if row and row["latest_date"]:
+                latest_synced = row["latest_date"]
+
+    if latest_synced:
+        return latest_synced + timedelta(days=1), today, "incremental"
+
+    oldest = await oura_client.find_oldest_data_date(user_id)
+    if oldest:
+        return oldest, today, "initial_backfill"
+
+    # No data yet on Oura account; do a no-op sync window for today.
+    return today, today, "initial_backfill"
+
+
+def _progress_percent(
+    start_pct: int,
+    end_pct: int,
+    current: int,
+    total: int,
+) -> int:
+    """Map a stage progress value into an overall percent range."""
+    if total <= 0:
+        return end_pct
+    current_clamped = min(max(current, 0), total)
+    span = end_pct - start_pct
+    return start_pct + int((current_clamped / total) * span)
+
+
+async def run_full_ingest_stream(
+    start_date: date | None,
+    end_date: date | None,
+    user_id: str,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Run full sync and emit progress events for NDJSON streaming."""
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def emit(
+        event_type: str,
+        *,
+        percent: int | None = None,
+        phase: str | None = None,
+        message: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        event: dict[str, Any] = {"type": event_type}
+        if percent is not None:
+            event["percent"] = max(0, min(100, int(percent)))
+        if phase is not None:
+            event["phase"] = phase
+        if message is not None:
+            event["message"] = message
+        if extra:
+            event.update(extra)
+        await queue.put(event)
+
+    async def worker() -> None:
+        sync_mode = "manual"
+        try:
+            await emit(
+                "progress",
+                percent=1,
+                phase="resolving_window",
+                message="Resolving sync window",
+            )
+
+            resolved_start = start_date
+            resolved_end = end_date
+            if resolved_start is None or resolved_end is None:
+                resolved_start, resolved_end, sync_mode = await resolve_sync_window(user_id)
+
+            await emit(
+                "progress",
+                percent=5,
+                phase="resolving_window",
+                message=f"Sync window {resolved_start} to {resolved_end}",
+            )
+
+            if resolved_start > resolved_end:
+                await emit(
+                    "done",
+                    percent=100,
+                    message="Already up to date. No new days to sync.",
+                    extra={
+                        "status": "completed",
+                        "days_processed": 0,
+                        "tags_processed": 0,
+                        "features_processed": 0,
+                        "start_date": str(resolved_start),
+                        "end_date": str(resolved_end),
+                        "sync_mode": sync_mode,
+                    },
+                )
+                return
+
+            async def raw_progress(source: str, current: int, total: int) -> None:
+                pct = _progress_percent(5, 50, current, total)
+                await emit(
+                    "progress",
+                    percent=pct,
+                    phase="fetch_raw",
+                    message=f"Fetched {source} ({current}/{total})",
+                )
+
+            raw_counts = await ingest_raw_data(
+                resolved_start,
+                resolved_end,
+                user_id,
+                progress_callback=raw_progress,
+            )
+
+            async def normalize_progress(current: int, total: int) -> None:
+                pct = _progress_percent(50, 85, current, total)
+                await emit(
+                    "progress",
+                    percent=pct,
+                    phase="normalize_daily",
+                    message=f"Normalized day {current}/{total}",
+                )
+
+            days_processed = await normalize_daily_data(
+                resolved_start,
+                resolved_end,
+                user_id,
+                progress_callback=normalize_progress,
+            )
+
+            async def tags_progress(current: int, total: int) -> None:
+                pct = _progress_percent(85, 92, current, total)
+                await emit(
+                    "progress",
+                    percent=pct,
+                    phase="ingest_tags",
+                    message=f"Processed tags {current}/{total}",
+                )
+
+            tags_processed = await ingest_tags(
+                resolved_start,
+                resolved_end,
+                user_id,
+                progress_callback=tags_progress,
+            )
+
+            await emit(
+                "progress",
+                percent=92,
+                phase="features",
+                message="Computing derived features",
+            )
+            features_processed = 0
+            if days_processed > 0:
+                from app.pipelines import features
+
+                async def features_progress(current: int, total: int) -> None:
+                    pct = _progress_percent(92, 99, current, total)
+                    await emit(
+                        "progress",
+                        percent=pct,
+                        phase="features",
+                        message=f"Computed features {current}/{total}",
+                    )
+
+                features_processed = await features.recompute_features(
+                    resolved_start,
+                    resolved_end,
+                    user_id,
+                    progress_callback=features_progress,
+                )
+            else:
+                await emit(
+                    "progress",
+                    percent=99,
+                    phase="features",
+                    message="No new days for feature recompute",
+                )
+
+            personal_info_ok = await ingest_personal_info(user_id)
+
+            if days_processed == 0:
+                if sync_mode == "incremental":
+                    done_message = "Already up to date. No new days to sync."
+                else:
+                    done_message = "No Oura data found to sync yet."
+            else:
+                done_message = (
+                    f"Ingested {days_processed} days ({sync_mode}), "
+                    f"{tags_processed} tags, {features_processed} feature days"
+                )
+
+            await emit(
+                "done",
+                percent=100,
+                message=done_message,
+                extra={
+                    "status": "completed",
+                    "days_processed": days_processed,
+                    "tags_processed": tags_processed,
+                    "features_processed": features_processed,
+                    "personal_info": personal_info_ok,
+                    "raw_counts": raw_counts,
+                    "start_date": str(resolved_start),
+                    "end_date": str(resolved_end),
+                    "sync_mode": sync_mode,
+                },
+            )
+        except Exception as e:
+            await emit("error", message=str(e))
+        finally:
+            await queue.put({"type": "_end"})
+
+    task = asyncio.create_task(worker())
+    try:
+        while True:
+            event = await queue.get()
+            if event.get("type") == "_end":
+                break
+            yield event
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def run_full_ingest(
+    start_date: date | None,
+    end_date: date | None,
+    user_id: str,
+) -> dict[str, Any]:
     """Run the full ingestion pipeline."""
+    sync_mode = "manual"
+    if start_date is None or end_date is None:
+        start_date, end_date, sync_mode = await resolve_sync_window(user_id)
+
+    if start_date > end_date:
+        return {
+            "status": "completed",
+            "raw_counts": {},
+            "days_processed": 0,
+            "tags_processed": 0,
+            "personal_info": False,
+            "start_date": start_date,
+            "end_date": end_date,
+            "sync_mode": sync_mode,
+        }
+
     raw_counts = await ingest_raw_data(start_date, end_date, user_id)
     days_processed = await normalize_daily_data(start_date, end_date, user_id)
     tags_processed = await ingest_tags(start_date, end_date, user_id)
@@ -560,4 +918,7 @@ async def run_full_ingest(start_date: date, end_date: date, user_id: str) -> dic
         "days_processed": days_processed,
         "tags_processed": tags_processed,
         "personal_info": personal_info_ok,
+        "start_date": start_date,
+        "end_date": end_date,
+        "sync_mode": sync_mode,
     }

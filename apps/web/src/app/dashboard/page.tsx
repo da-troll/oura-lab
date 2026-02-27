@@ -222,13 +222,15 @@ export default function DashboardPage() {
         <h1 className="text-3xl font-bold">Dashboard</h1>
         <div className="flex items-center gap-2">
           <Select value={String(days)} onValueChange={(v) => setDays(Number(v))}>
-            <SelectTrigger className="w-[100px]">
+            <SelectTrigger className="w-[120px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="7">7 days</SelectItem>
               <SelectItem value="10">10 days</SelectItem>
               <SelectItem value="30">30 days</SelectItem>
+              <SelectItem value="60">60 days</SelectItem>
+              <SelectItem value="100">100 days</SelectItem>
             </SelectContent>
           </Select>
           <Select value="dashboard" onValueChange={(value) => router.push(`/${value}`)}>

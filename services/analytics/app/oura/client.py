@@ -1,7 +1,7 @@
 """Oura API client with retry logic (multi-user)."""
 
 import asyncio
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import httpx
@@ -108,107 +108,202 @@ class OuraClient:
                     )
                 raise OuraAPIError(0, f"Request failed: {e}")
 
+    async def _request_all_pages(
+        self,
+        endpoint: str,
+        user_id: str,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch all paginated pages for an endpoint using next_token."""
+        all_items: list[dict[str, Any]] = []
+        next_token: str | None = None
+        seen_tokens: set[str] = set()
+        page_count = 0
+
+        while True:
+            page_count += 1
+            page_params = dict(params or {})
+            if next_token:
+                page_params["next_token"] = next_token
+
+            response = await self._request(
+                "GET",
+                endpoint,
+                user_id,
+                params=page_params,
+            )
+
+            data = response.get("data", [])
+            if isinstance(data, list):
+                all_items.extend(data)
+
+            token = response.get("next_token")
+            if not token:
+                break
+
+            # Guard against malformed pagination responses.
+            if token in seen_tokens or page_count >= 1000:
+                break
+            seen_tokens.add(token)
+            next_token = token
+
+        return all_items
+
+    @staticmethod
+    def _extract_record_date(record: dict[str, Any]) -> date | None:
+        """Extract a date from common Oura payload fields."""
+        day = record.get("day")
+        if isinstance(day, str):
+            try:
+                return date.fromisoformat(day)
+            except ValueError:
+                pass
+
+        for key in ("bedtime_end", "bedtime_start", "start_datetime", "end_datetime"):
+            value = record.get(key)
+            if not isinstance(value, str):
+                continue
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+            except ValueError:
+                continue
+
+        return None
+
     async def fetch_daily_sleep(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/daily_sleep", user_id,
+        return await self._request_all_pages(
+            "/usercollection/daily_sleep",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_sleep_sessions(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/sleep", user_id,
+        return await self._request_all_pages(
+            "/usercollection/sleep",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_daily_readiness(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/daily_readiness", user_id,
+        return await self._request_all_pages(
+            "/usercollection/daily_readiness",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_daily_activity(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/daily_activity", user_id,
+        return await self._request_all_pages(
+            "/usercollection/daily_activity",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_heart_rate(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/heartrate", user_id,
+        return await self._request_all_pages(
+            "/usercollection/heartrate",
+            user_id,
             params={
                 "start_datetime": f"{start_date}T00:00:00+00:00",
                 "end_datetime": f"{end_date}T23:59:59+00:00",
             },
         )
-        return response.get("data", [])
 
     async def fetch_tags(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/tag", user_id,
+        return await self._request_all_pages(
+            "/usercollection/tag",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_workouts(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/workout", user_id,
+        return await self._request_all_pages(
+            "/usercollection/workout",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_sessions(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/session", user_id,
+        return await self._request_all_pages(
+            "/usercollection/session",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_daily_stress(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/daily_stress", user_id,
+        return await self._request_all_pages(
+            "/usercollection/daily_stress",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_daily_spo2(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/daily_spo2", user_id,
+        return await self._request_all_pages(
+            "/usercollection/daily_spo2",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
 
     async def fetch_daily_cardiovascular_age(
         self, start_date: date, end_date: date, user_id: str
     ) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET", "/usercollection/daily_cardiovascular_age", user_id,
+        return await self._request_all_pages(
+            "/usercollection/daily_cardiovascular_age",
+            user_id,
             params={"start_date": str(start_date), "end_date": str(end_date)},
         )
-        return response.get("data", [])
+
+    async def find_oldest_data_date(self, user_id: str) -> date | None:
+        """Find the oldest available day in the user's Oura history."""
+        today = date.today()
+        probe_start = date(2010, 1, 1)
+        earliest: date | None = None
+        window_days = 180
+
+        probe_fetchers = (
+            self.fetch_daily_sleep,
+            self.fetch_daily_activity,
+            self.fetch_daily_readiness,
+        )
+
+        for fetcher in probe_fetchers:
+            window_end = today
+            while window_end >= probe_start:
+                window_start = max(
+                    probe_start,
+                    window_end - date.resolution * (window_days - 1),
+                )
+                records = await fetcher(window_start, window_end, user_id)
+                for record in records:
+                    record_date = self._extract_record_date(record)
+                    if record_date is None:
+                        continue
+                    if earliest is None or record_date < earliest:
+                        earliest = record_date
+                window_end = window_start - date.resolution
+            if earliest is not None:
+                break
+
+        return earliest
 
     async def fetch_personal_info(self, user_id: str) -> dict[str, Any]:
         return await self._request("GET", "/usercollection/personal_info", user_id)

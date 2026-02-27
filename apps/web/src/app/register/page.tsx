@@ -70,6 +70,7 @@ export default function RegisterPage() {
                 onChange={(e) => setEmail(e.target.value)}
                 required
                 autoComplete="email"
+                suppressHydrationWarning
                 className="w-full border rounded-md px-3 py-2 bg-background"
               />
             </div>
@@ -85,6 +86,7 @@ export default function RegisterPage() {
                 required
                 minLength={8}
                 autoComplete="new-password"
+                suppressHydrationWarning
                 className="w-full border rounded-md px-3 py-2 bg-background"
               />
             </div>
@@ -100,6 +102,7 @@ export default function RegisterPage() {
                 required
                 minLength={8}
                 autoComplete="new-password"
+                suppressHydrationWarning
                 className="w-full border rounded-md px-3 py-2 bg-background"
               />
             </div>

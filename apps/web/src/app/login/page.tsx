@@ -58,6 +58,7 @@ export default function LoginPage() {
                 onChange={(e) => setEmail(e.target.value)}
                 required
                 autoComplete="email"
+                suppressHydrationWarning
                 className="w-full border rounded-md px-3 py-2 bg-background"
               />
             </div>
@@ -72,6 +73,7 @@ export default function LoginPage() {
                 onChange={(e) => setPassword(e.target.value)}
                 required
                 autoComplete="current-password"
+                suppressHydrationWarning
                 className="w-full border rounded-md px-3 py-2 bg-background"
               />
             </div>

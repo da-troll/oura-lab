@@ -2,7 +2,7 @@
 
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import numpy as np
 import pandas as pd
@@ -64,6 +64,10 @@ def compute_rolling_features(
         features["rm_14_readiness_score"] = float(readiness.iloc[:-1].tail(14).mean()) if len(readiness) > 1 else None
     if len(readiness) >= 28:
         features["rm_28_readiness_score"] = float(readiness.iloc[:-1].tail(28).mean()) if len(readiness) > 1 else None
+    if len(readiness) >= 60:
+        features["rm_60_readiness_score"] = float(readiness.iloc[:-1].tail(60).mean()) if len(readiness) > 1 else None
+    if len(readiness) >= 100:
+        features["rm_100_readiness_score"] = float(readiness.iloc[:-1].tail(100).mean()) if len(readiness) > 1 else None
 
     # Sleep total rolling means
     sleep = history["sleep_total_seconds"].dropna()
@@ -75,6 +79,10 @@ def compute_rolling_features(
         features["rm_14_sleep_total_seconds"] = float(sleep.iloc[:-1].tail(14).mean()) if len(sleep) > 1 else None
     if len(sleep) >= 28:
         features["rm_28_sleep_total_seconds"] = float(sleep.iloc[:-1].tail(28).mean()) if len(sleep) > 1 else None
+    if len(sleep) >= 60:
+        features["rm_60_sleep_total_seconds"] = float(sleep.iloc[:-1].tail(60).mean()) if len(sleep) > 1 else None
+    if len(sleep) >= 100:
+        features["rm_100_sleep_total_seconds"] = float(sleep.iloc[:-1].tail(100).mean()) if len(sleep) > 1 else None
 
     # Steps rolling means
     steps = history["steps"].dropna()
@@ -84,6 +92,10 @@ def compute_rolling_features(
         features["rm_14_steps"] = float(steps.iloc[:-1].tail(14).mean()) if len(steps) > 1 else None
     if len(steps) >= 28:
         features["rm_28_steps"] = float(steps.iloc[:-1].tail(28).mean()) if len(steps) > 1 else None
+    if len(steps) >= 60:
+        features["rm_60_steps"] = float(steps.iloc[:-1].tail(60).mean()) if len(steps) > 1 else None
+    if len(steps) >= 100:
+        features["rm_100_steps"] = float(steps.iloc[:-1].tail(100).mean()) if len(steps) > 1 else None
 
     # Deltas vs 7-day rolling mean
     if "rm_7_readiness_score" in features and features["rm_7_readiness_score"] is not None:
@@ -154,6 +166,10 @@ def compute_rolling_features(
             features["rm_14_hrv_average"] = float(hrv.iloc[:-1].tail(14).mean())
         if len(hrv) >= 29:
             features["rm_28_hrv_average"] = float(hrv.iloc[:-1].tail(28).mean())
+        if len(hrv) >= 61:
+            features["rm_60_hrv_average"] = float(hrv.iloc[:-1].tail(60).mean())
+        if len(hrv) >= 101:
+            features["rm_100_hrv_average"] = float(hrv.iloc[:-1].tail(100).mean())
 
         if "rm_7_hrv_average" in features and features["rm_7_hrv_average"] is not None:
             current_hrv = history.loc[target_dt, "hrv_average"]
@@ -195,16 +211,24 @@ def compute_rolling_features(
     return features
 
 
-async def recompute_features(start_date: date, end_date: date, user_id: str) -> int:
+async def recompute_features(
+    start_date: date,
+    end_date: date,
+    user_id: str,
+    progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+) -> int:
     """Recompute features for a date range."""
-    history_start = start_date - timedelta(days=28)
+    history_start = start_date - timedelta(days=100)
     df = await load_daily_data(history_start, end_date, user_id)
 
     if df.empty:
+        if progress_callback is not None:
+            await progress_callback(0, 0)
         return 0
 
     days_processed = 0
     current = start_date
+    total_days = (end_date - start_date).days + 1
 
     async with get_db_for_user(user_id) as conn:
         while current <= end_date:
@@ -235,5 +259,8 @@ async def recompute_features(start_date: date, end_date: date, user_id: str) -> 
                 days_processed += 1
 
             current += timedelta(days=1)
+            if progress_callback is not None:
+                processed = (current - start_date).days
+                await progress_callback(processed, total_days)
 
     return days_processed

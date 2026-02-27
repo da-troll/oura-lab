@@ -3,7 +3,7 @@
 import { useAuth } from "@/lib/auth-context";
 
 /**
- * Client-side auth guard (UX layer only — real security is in middleware.ts).
+ * Client-side auth guard (UX layer only — real security is in proxy.ts).
  * Shows a loading state while auth is being checked.
  */
 export function AuthGuard({ children }: { children: React.ReactNode }) {

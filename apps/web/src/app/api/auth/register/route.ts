@@ -19,12 +19,15 @@ export async function POST(request: NextRequest) {
 
   const body = await request.json();
 
-  // Forward client IP so backend can log/audit the real client
-  const clientIp =
-    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    request.headers.get("x-real-ip") ||
-    request.ip ||
-    "unknown";
+  // Resolve client IP for backend logging/audit.
+  // Use request.ip when available; otherwise use the last X-Forwarded-For hop.
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  const forwardedIp = forwardedFor
+    ?.split(",")
+    .map((ip) => ip.trim())
+    .filter(Boolean)
+    .at(-1);
+  const clientIp = request.ip || forwardedIp || "unknown";
 
   const response = await fetch(`${ANALYTICS_URL}/auth/register`, {
     method: "POST",
