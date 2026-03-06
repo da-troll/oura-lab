@@ -32,6 +32,16 @@ function getCsrfToken(): string {
   return match ? decodeURIComponent(match[1]) : "";
 }
 
+async function parseJsonSafely(response: Response): Promise<Record<string, unknown> | null> {
+  const raw = await response.text();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -47,8 +57,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // Check if logged in
         const res = await fetch("/api/auth/me");
         if (res.ok) {
-          const data = await res.json();
-          setUser(data);
+          const data = await parseJsonSafely(res);
+          if (data && typeof data.user_id === "string" && typeof data.email === "string") {
+            setUser({ user_id: data.user_id, email: data.email });
+          }
         }
       } catch {
         // Not logged in
@@ -71,12 +83,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
 
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || data.error || "Login failed");
+        const data = await parseJsonSafely(res);
+        const detail = typeof data?.detail === "string" ? data.detail : null;
+        const error = typeof data?.error === "string" ? data.error : null;
+        throw new Error(detail || error || `Login failed (${res.status})`);
       }
 
-      const data = await res.json();
-      setUser(data);
+      const data = await parseJsonSafely(res);
+      if (!data || typeof data.user_id !== "string" || typeof data.email !== "string") {
+        throw new Error("Login returned an invalid response");
+      }
+      setUser({ user_id: data.user_id, email: data.email });
       router.push("/dashboard");
     },
     [router]
@@ -94,12 +111,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
 
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || data.error || "Registration failed");
+        const data = await parseJsonSafely(res);
+        const detail = typeof data?.detail === "string" ? data.detail : null;
+        const error = typeof data?.error === "string" ? data.error : null;
+        throw new Error(detail || error || `Registration failed (${res.status})`);
       }
 
-      const data = await res.json();
-      setUser(data);
+      const data = await parseJsonSafely(res);
+      if (!data || typeof data.user_id !== "string" || typeof data.email !== "string") {
+        throw new Error("Registration returned an invalid response");
+      }
+      setUser({ user_id: data.user_id, email: data.email });
       router.push("/dashboard");
     },
     [router]
