@@ -42,7 +42,7 @@ def initialize_system_prompt() -> None:
     SYSTEM_PROMPT = prompt
 
 INTRO_SENTINEL = "__OURALIE_INTRO__"
-DEFAULT_LOOKBACK_DAYS = 10
+DEFAULT_LOOKBACK_DAYS = 30
 FOLLOW_UP_QUESTION = "Would you like a different time period, chart type, or another edit?"
 FOLLOW_UP_QUESTION_ITALIC = f"*{FOLLOW_UP_QUESTION}*"
 
@@ -1038,8 +1038,8 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "days": {
                         "type": "integer",
-                        "description": "Number of days to look back (default 10)",
-                        "enum": [7, 10, 14, 30, 60, 90],
+                        "description": "Number of days to look back (default 30)",
+                        "enum": [7, 14, 30, 60, 90, 120],
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                     "chart_type": {
@@ -1057,7 +1057,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_metric_series",
-            "description": "Get daily values for a specific metric over a date range. If no dates are provided, default to the last 10 days.",
+            "description": "Get daily values for a specific metric over a date range. If no dates are provided, default to the last 30 days.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1083,7 +1083,7 @@ TOOL_DEFINITIONS = [
                     },
                     "lookback_days": {
                         "type": "integer",
-                        "description": "How many days back from today to include if start/end are omitted (default 10)",
+                        "description": "How many days back from today to include if start/end are omitted (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                     "chart_type": {
@@ -1125,7 +1125,7 @@ TOOL_DEFINITIONS = [
                     },
                     "lookback_days": {
                         "type": "integer",
-                        "description": "How many days back from today to include if start/end are omitted (default 10)",
+                        "description": "How many days back from today to include if start/end are omitted (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                     "chart_type": {
@@ -1143,7 +1143,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_scatter_data",
-            "description": "Get paired daily x/y metric points for scatter charts (e.g., readiness_score vs sleep_score). If no dates are provided, default to the last 10 days.",
+            "description": "Get paired daily x/y metric points for scatter charts (e.g., readiness_score vs sleep_score). If no dates are provided, default to the last 30 days.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1167,7 +1167,7 @@ TOOL_DEFINITIONS = [
                     },
                     "lookback_days": {
                         "type": "integer",
-                        "description": "How many days back from today to include if start/end are omitted (default 10)",
+                        "description": "How many days back from today to include if start/end are omitted (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                 },
@@ -1203,7 +1203,7 @@ TOOL_DEFINITIONS = [
                     },
                     "lookback_days": {
                         "type": "integer",
-                        "description": "How many days back from today to include if start/end are omitted (default 10)",
+                        "description": "How many days back from today to include if start/end are omitted (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                     "chart_type": {
@@ -1240,7 +1240,7 @@ TOOL_DEFINITIONS = [
                     },
                     "lookback_days": {
                         "type": "integer",
-                        "description": "How many days back from today to include if start/end are omitted (default 10)",
+                        "description": "How many days back from today to include if start/end are omitted (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                     "bins": {
@@ -1268,7 +1268,7 @@ TOOL_DEFINITIONS = [
                     },
                     "period_days": {
                         "type": "integer",
-                        "description": "Days per period (current and previous). Default 10.",
+                        "description": "Days per period (current and previous). Default 30.",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                 },
@@ -1303,7 +1303,7 @@ TOOL_DEFINITIONS = [
                     },
                     "lookback_days": {
                         "type": "integer",
-                        "description": "How many days back from today to include if start/end are omitted (default 10)",
+                        "description": "How many days back from today to include if start/end are omitted (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                 },
@@ -1333,7 +1333,7 @@ TOOL_DEFINITIONS = [
                     },
                     "lookback_days": {
                         "type": "integer",
-                        "description": "How many days back from today to include if start/end are omitted (default 10)",
+                        "description": "How many days back from today to include if start/end are omitted (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                 },
@@ -1351,7 +1351,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "days": {
                         "type": "integer",
-                        "description": "Number of days to look back (default 10)",
+                        "description": "Number of days to look back (default 30)",
                         "default": DEFAULT_LOOKBACK_DAYS,
                     },
                     "chart_type": {
@@ -2688,6 +2688,18 @@ async def run_chat(
 
     is_intro = message == INTRO_SENTINEL
 
+    # For intro, check if the user has synced Oura data
+    has_synced_data = False
+    if is_intro:
+        async with get_db_for_user(user_id) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) as cnt FROM oura_daily WHERE user_id = %s LIMIT 1",
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+                has_synced_data = (row["cnt"] or 0) > 0
+
     # Ensure conversation exists
     conv_id = await _ensure_conversation(
         user_id, conversation_id, "New conversation" if is_intro else message[:50]
@@ -2719,8 +2731,21 @@ async def run_chat(
         for row in unsummarized_history_rows
     ]
 
+    if is_intro and has_synced_data:
+        intro_prompt = "Introduce yourself and give me a quick snapshot of how I've been doing over the last 30 days."
+    elif is_intro:
+        intro_prompt = (
+            "Introduce yourself to a new user who hasn't synced their Oura data yet. "
+            "Briefly explain what you can help with once they have data (sleep analysis, activity trends, readiness insights, correlations, etc.). "
+            "Then encourage them to go to the Settings page, connect their Oura account, and hit the Sync button. "
+            "Mention that the first sync backfills their full Oura history so it may take a little while with large amounts of data, "
+            "but every sync after that will be super quick. Do NOT use any data tools since there is no data yet."
+        )
+    else:
+        intro_prompt = None
+
     memory_query = (
-        "Introduce yourself and give me a quick snapshot of how I've been doing recently."
+        intro_prompt
         if is_intro else message
     )
     long_term_memory_block, memory_injected_tokens, memory_retrieved_count = await _retrieve_long_term_memory_block(
@@ -2777,7 +2802,7 @@ async def run_chat(
     if is_intro:
         intro_message = {
             "role": "user",
-            "content": "Introduce yourself and give me a quick snapshot of how I've been doing recently.",
+            "content": intro_prompt,
         }
         messages.append(intro_message)
         context_tokens_est += _estimate_message_tokens(intro_message)
