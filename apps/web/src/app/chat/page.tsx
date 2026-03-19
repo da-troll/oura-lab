@@ -521,7 +521,7 @@ export default function ChatPage() {
               value="chat"
               onValueChange={(value) => router.push(`/${value}`)}
             >
-              <SelectTrigger className="w-[135px]">
+              <SelectTrigger className="w-[160px]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -595,14 +595,14 @@ export default function ChatPage() {
       {/* Main chat area */}
       <div className="flex-1 flex flex-col">
         {/* Header */}
-        <div className="flex justify-between items-center p-4 border-b">
+        <div className="flex justify-between items-center p-3 border-b">
           <h1 className="text-xl font-semibold">Ouralie</h1>
           <div className="flex items-center gap-2">
             <Select
               value="chat"
               onValueChange={(value) => router.push(`/${value}`)}
             >
-              <SelectTrigger className="w-[135px]">
+              <SelectTrigger className="w-[160px]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
