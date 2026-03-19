@@ -653,42 +653,59 @@ def _build_chart_payload(tool_name: str, args: dict, raw_result: str) -> dict[st
         return None
 
     if tool_name == "get_summary":
-        summary_keys = [
+        # Score-based metrics (already 0-100 scale)
+        score_keys = [
             ("readiness_avg", "Readiness"),
             ("sleep_avg", "Sleep"),
             ("activity_avg", "Activity"),
-            ("steps_avg", "Steps"),
-            ("hrv_avg", "HRV"),
-            ("sleep_hours_avg", "Sleep Hours"),
         ]
+        # Metrics with different scales — normalize to 0-100 for radar
+        scaled_keys = [
+            ("steps_avg", "Steps", 0, 15000),
+            ("hrv_avg", "HRV", 0, 100),
+            ("sleep_hours_avg", "Sleep Hours", 0, 10),
+        ]
+
+        bar_data = []
         radar_data = []
-        for key, label in summary_keys:
+        for key, label in score_keys:
             value = parsed.get(key)
             if value is None:
                 continue
-            radar_data.append({"metric": label, "value": round(float(value), 2)})
+            v = round(float(value), 1)
+            bar_data.append({"metric": label, "value": v})
+            radar_data.append({"metric": label, "value": v})
 
-        if not radar_data:
+        for key, label, lo, hi in scaled_keys:
+            value = parsed.get(key)
+            if value is None:
+                continue
+            v = round(float(value), 1)
+            bar_data.append({"metric": label, "value": v})
+            normalized = round(min(max((float(value) - lo) / (hi - lo) * 100, 0), 100), 1)
+            radar_data.append({"metric": label, "value": normalized})
+
+        if not bar_data:
             return None
 
-        chart_type = (args.get("chart_type") or "radar").strip().lower()
-        if chart_type == "bar":
+        chart_type = (args.get("chart_type") or "bar").strip().lower()
+        if chart_type == "radar":
             return {
-                "chartType": "grouped_bar",
+                "chartType": "radar",
                 "title": "Health Summary Snapshot",
                 "xKey": "metric",
-                "series": [{"key": "value", "label": "Average", "color": "#6366f1"}],
+                "series": [{"key": "value", "label": "Score (normalized)", "color": "#6366f1"}],
                 "data": radar_data,
                 "source": tool_name,
                 "dateRange": parsed.get("period"),
             }
 
         return {
-            "chartType": "radar",
+            "chartType": "grouped_bar",
             "title": "Health Summary Snapshot",
             "xKey": "metric",
             "series": [{"key": "value", "label": "Average", "color": "#6366f1"}],
-            "data": radar_data,
+            "data": bar_data,
             "source": tool_name,
             "dateRange": parsed.get("period"),
         }
