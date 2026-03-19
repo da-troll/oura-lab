@@ -688,7 +688,7 @@ def _build_chart_payload(tool_name: str, args: dict, raw_result: str) -> dict[st
         if not bar_data:
             return None
 
-        chart_type = (args.get("chart_type") or "bar").strip().lower()
+        chart_type = (args.get("chart_type") or "radar").strip().lower()
         if chart_type == "radar":
             return {
                 "chartType": "radar",
@@ -2749,7 +2749,7 @@ async def run_chat(
     ]
 
     if is_intro and has_synced_data:
-        intro_prompt = "Introduce yourself and give me a quick snapshot of how I've been doing over the last 30 days."
+        intro_prompt = "Introduce yourself and give me a quick snapshot of how I've been doing over the last 30 days. Use the get_summary tool with chart_type set to 'radar'."
     elif is_intro:
         intro_prompt = (
             "Introduce yourself to a new user who hasn't synced their Oura data yet. "
