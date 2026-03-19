@@ -664,7 +664,7 @@ def _build_chart_payload(tool_name: str, args: dict, raw_result: str) -> dict[st
         scaled_keys = [
             ("steps_avg", "Steps", 0, 15000, False),
             ("hrv_avg", "HRV", 0, 100, False),
-            ("stress_avg", "Recovery", 0, 60, True),
+            ("recovery_avg", "Recovery", 0, 120, False),
         ]
 
         bar_data = []
