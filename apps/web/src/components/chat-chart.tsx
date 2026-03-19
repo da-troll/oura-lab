@@ -314,13 +314,19 @@ export const ChatChart = memo(function ChatChart({ chart }: { chart: ChatChartAr
       ))}
     </ScatterChart>
   ) : chart.chartType === "radar" ? (
-    <RadarChart data={chart.data}>
-      <PolarGrid />
+    <RadarChart data={chart.data} cx="50%" cy="50%" outerRadius="75%">
+      <PolarGrid gridType="circle" stroke="#444" />
       <PolarAngleAxis
         dataKey={chart.xKey}
+        tick={{ fill: "#aaa", fontSize: 13 }}
         tickFormatter={(value) => (typeof value === "string" ? humanizeLabel(value) : String(value))}
       />
-      <PolarRadiusAxis tickFormatter={formatNumericTick} />
+      <PolarRadiusAxis
+        angle={30}
+        domain={[0, 100]}
+        tick={{ fill: "#666", fontSize: 11 }}
+        tickFormatter={formatNumericTick}
+      />
       <Tooltip content={<ChatChartTooltip unit={chart.unit} />} cursor={false} />
       {chart.series.map((series) => (
         <Radar
@@ -328,8 +334,10 @@ export const ChatChart = memo(function ChatChart({ chart }: { chart: ChatChartAr
           dataKey={series.key}
           name={series.label}
           stroke={series.color || "#6366f1"}
+          strokeWidth={2}
           fill={series.color || "#6366f1"}
-          fillOpacity={0.25}
+          fillOpacity={0.35}
+          dot={{ r: 3, fill: "#fff", strokeWidth: 2, stroke: series.color || "#6366f1" }}
         />
       ))}
     </RadarChart>

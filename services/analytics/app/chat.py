@@ -660,10 +660,11 @@ def _build_chart_payload(tool_name: str, args: dict, raw_result: str) -> dict[st
             ("activity_avg", "Activity"),
         ]
         # Metrics with different scales — normalize to 0-100 for radar
+        # (lo, hi, invert): invert=True means lower raw value = higher score
         scaled_keys = [
-            ("steps_avg", "Steps", 0, 15000),
-            ("hrv_avg", "HRV", 0, 100),
-            ("sleep_hours_avg", "Sleep Hours", 0, 10),
+            ("steps_avg", "Steps", 0, 15000, False),
+            ("hrv_avg", "HRV", 0, 100, False),
+            ("stress_avg", "Recovery", 0, 60, True),
         ]
 
         bar_data = []
@@ -676,13 +677,15 @@ def _build_chart_payload(tool_name: str, args: dict, raw_result: str) -> dict[st
             bar_data.append({"metric": label, "value": v})
             radar_data.append({"metric": label, "value": v})
 
-        for key, label, lo, hi in scaled_keys:
+        for key, label, lo, hi, invert in scaled_keys:
             value = parsed.get(key)
             if value is None:
                 continue
             v = round(float(value), 1)
             bar_data.append({"metric": label, "value": v})
             normalized = round(min(max((float(value) - lo) / (hi - lo) * 100, 0), 100), 1)
+            if invert:
+                normalized = round(100 - normalized, 1)
             radar_data.append({"metric": label, "value": normalized})
 
         if not bar_data:
