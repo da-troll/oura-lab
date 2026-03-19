@@ -79,11 +79,17 @@ function formatDateRangeLabel(dateRange?: string): string {
   return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
 }
 
+const UPPERCASE_WORDS = new Set(["hrv", "rhr", "spo2", "bmi"]);
+
 function titleCaseWords(value: string): string {
   return value
     .split(" ")
     .filter(Boolean)
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .map((word) =>
+      UPPERCASE_WORDS.has(word.toLowerCase())
+        ? word.toUpperCase()
+        : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+    )
     .join(" ");
 }
 
